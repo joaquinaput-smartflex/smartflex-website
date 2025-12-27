@@ -903,6 +903,15 @@
         .fade-in-up {
             animation: fadeInUp 0.6s ease forwards;
         }
+
+        /* Loading state for projects */
+        .loading-projects {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 60px;
+            color: var(--gray-600);
+            font-size: 1.1rem;
+        }
     </style>
 </head>
 <body>
@@ -1034,39 +1043,11 @@
             <div class="section-header">
                 <span class="section-tag">Nuestro Portfolio</span>
                 <h2>Proyectos Destacados</h2>
-                <p>Conocé algunos de los proyectos que hemos desarrollado para nuestros clientes.</p>
+                <p>Conoce algunos de los proyectos que hemos desarrollado para nuestros clientes.</p>
             </div>
-            <div class="projects-grid">
-                <div class="project-card">
-                    <div class="project-image">
-                        <img src="/assets/images/projects/colegio-educativo.jpg" alt="Complejo Educativo SMARTFLEX">
-                    </div>
-                    <div class="project-content">
-                        <span class="project-tag">Construcción</span>
-                        <h3>Complejo Educativo</h3>
-                        <p>Construcción integral de instalaciones educativas con espacios modernos y funcionales.</p>
-                    </div>
-                </div>
-                <div class="project-card">
-                    <div class="project-image">
-                        <img src="/assets/images/projects/residencia-moderna.jpg" alt="Residencia Moderna SMARTFLEX">
-                    </div>
-                    <div class="project-content">
-                        <span class="project-tag">Vivienda</span>
-                        <h3>Residencia Moderna</h3>
-                        <p>Diseño y construcción de vivienda unifamiliar con acabados de primera calidad.</p>
-                    </div>
-                </div>
-                <div class="project-card">
-                    <div class="project-image">
-                        <img src="/assets/images/projects/casa-contemporanea.jpg" alt="Casa Contemporanea SMARTFLEX">
-                    </div>
-                    <div class="project-content">
-                        <span class="project-tag">Vivienda</span>
-                        <h3>Casa Contemporánea</h3>
-                        <p>Proyecto residencial con diseño contemporáneo y materiales sustentables.</p>
-                    </div>
-                </div>
+            <div class="projects-grid" id="projectsGrid">
+                <!-- Projects loaded dynamically from API -->
+                <div class="loading-projects">Cargando proyectos...</div>
             </div>
         </div>
     </section>
@@ -1257,6 +1238,83 @@
                 navLinks.style.boxShadow = '0 4px 6px rgba(0,0,0,0.1)';
             }
         });
+
+        // Load projects from API
+        async function loadProjects() {
+            const grid = document.getElementById('projectsGrid');
+            try {
+                const response = await fetch('https://wa.smartflex.com.ar/admin/api/public/web-projects?featured_only=true&limit=6');
+                const data = await response.json();
+
+                if (data.projects && data.projects.length > 0) {
+                    grid.innerHTML = data.projects.map(project => `
+                        <div class="project-card">
+                            <div class="project-image">
+                                <img src="/assets/images/projects/${project.image_filename}"
+                                     alt="${project.image_alt || project.title}"
+                                     onerror="this.src='/assets/images/hero/colegio-panoramica.jpg'">
+                            </div>
+                            <div class="project-content">
+                                <span class="project-tag">${formatCategory(project.category)}</span>
+                                <h3>${project.title}</h3>
+                                <p>${project.short_description || ''}</p>
+                            </div>
+                        </div>
+                    `).join('');
+                } else {
+                    grid.innerHTML = '<p style="text-align:center;color:#666;">No hay proyectos disponibles.</p>';
+                }
+            } catch (error) {
+                console.error('Error loading projects:', error);
+                // Fallback to static content if API fails
+                grid.innerHTML = `
+                    <div class="project-card">
+                        <div class="project-image">
+                            <img src="/assets/images/projects/colegio-educativo.jpg" alt="Complejo Educativo SMARTFLEX">
+                        </div>
+                        <div class="project-content">
+                            <span class="project-tag">Construccion</span>
+                            <h3>Complejo Educativo</h3>
+                            <p>Construccion integral de instalaciones educativas con espacios modernos y funcionales.</p>
+                        </div>
+                    </div>
+                    <div class="project-card">
+                        <div class="project-image">
+                            <img src="/assets/images/projects/residencia-moderna.jpg" alt="Residencia Moderna SMARTFLEX">
+                        </div>
+                        <div class="project-content">
+                            <span class="project-tag">Vivienda</span>
+                            <h3>Residencia Moderna</h3>
+                            <p>Diseno y construccion de vivienda unifamiliar con acabados de primera calidad.</p>
+                        </div>
+                    </div>
+                    <div class="project-card">
+                        <div class="project-image">
+                            <img src="/assets/images/projects/casa-contemporanea.jpg" alt="Casa Contemporanea SMARTFLEX">
+                        </div>
+                        <div class="project-content">
+                            <span class="project-tag">Vivienda</span>
+                            <h3>Casa Contemporanea</h3>
+                            <p>Proyecto residencial con diseno contemporaneo y materiales sustentables.</p>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        function formatCategory(category) {
+            const categories = {
+                'construccion': 'Construccion',
+                'vivienda': 'Vivienda',
+                'reforma': 'Reforma',
+                'iot': 'IoT',
+                'industrial': 'Industrial'
+            };
+            return categories[category] || category;
+        }
+
+        // Load projects on page load
+        document.addEventListener('DOMContentLoaded', loadProjects);
     </script>
 </body>
 </html>

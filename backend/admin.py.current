@@ -1,0 +1,3374 @@
+"""
+SMARTFLEX Admin Panel - Backend API
+Complete admin endpoints for managing companies, customers, devices, and system config.
+
+Uses JWT tokens for authentication.
+"""
+import logging
+import secrets
+import hashlib
+import json
+from datetime import datetime, timedelta
+from typing import Optional, List
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+import jwt
+
+from . import db
+from . import mqtt_handler
+
+# === CONFIGURATION ===
+
+JWT_SECRET = secrets.token_hex(32)
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24
+
+# Default password - loaded from DB, fallback to this value
+DEFAULT_PASSWORD_FALLBACK = "iot@Smartflex"
+
+
+def get_default_password_hash():
+    """Get default password hash from system_config or use fallback."""
+    conn = None
+    cursor = None
+    try:
+        conn = db.get_connection()
+        if conn:
+            cursor = conn.cursor(dictionary=True, buffered=True)
+            cursor.execute("SELECT config_value FROM system_config WHERE config_key = 'default_password'")
+            row = cursor.fetchone()
+            if row and row.get('config_value'):
+                return hashlib.sha256(row['config_value'].encode()).hexdigest()
+    except Exception:
+        pass
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+    return hashlib.sha256(DEFAULT_PASSWORD_FALLBACK.encode()).hexdigest()
+
+
+def get_current_user_role(username: str) -> str:
+    """Get the role of a user from DB."""
+    conn = None
+    cursor = None
+    try:
+        conn = db.get_connection()
+        if conn:
+            cursor = conn.cursor(dictionary=True, buffered=True)
+            cursor.execute("SELECT role FROM admin_users WHERE username = %s", (username,))
+            row = cursor.fetchone()
+            if row:
+                return row.get('role', 'viewer')
+    except Exception:
+        pass
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+    return 'viewer'
+
+
+def check_superadmin_protection(target_id: int, current_username: str):
+    """Check if target user is superadmin and current user is not superadmin.
+    Raises HTTPException if non-superadmin tries to modify superadmin."""
+    conn = None
+    cursor = None
+    try:
+        conn = db.get_connection()
+        if not conn:
+            raise HTTPException(status_code=500, detail="Error de conexión")
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        cursor.execute("SELECT username, role FROM admin_users WHERE id = %s", (target_id,))
+        target = cursor.fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        # If target is superadmin, only superadmin can modify
+        if target.get('role') == 'superadmin':
+            current_role = get_current_user_role(current_username)
+            if current_role != 'superadmin':
+                raise HTTPException(status_code=403, detail="Solo un superadmin puede modificar a otro superadmin")
+
+        return target
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+security = HTTPBearer()
+router = APIRouter(prefix="/admin/api", tags=["Admin"])
+
+
+# === PYDANTIC MODELS ===
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    token: str
+    expires_at: str
+    must_change_password: bool = False
+
+# Company Models
+class CompanyCreate(BaseModel):
+    name: str
+    tax_id: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    province: Optional[str] = None
+    country: Optional[str] = "Argentina"
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    contact_person: Optional[str] = None
+    notification_phone: Optional[str] = None  # WhatsApp for level 2 escalation
+    notes: Optional[str] = None
+    status: Optional[str] = "active"
+
+class CompanyUpdate(BaseModel):
+    name: Optional[str] = None
+    tax_id: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    province: Optional[str] = None
+    country: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    contact_person: Optional[str] = None
+    notification_phone: Optional[str] = None  # WhatsApp for level 2 escalation
+    notes: Optional[str] = None
+    status: Optional[str] = None
+
+# Customer/Operator Models
+class CustomerCreate(BaseModel):
+    first_name: str
+    last_name: str
+    phone: str
+    email: Optional[str] = None
+    notifications_enabled: Optional[bool] = True
+    language: Optional[str] = "es"
+    notes: Optional[str] = None
+    status: Optional[str] = "active"
+    # Empresas asociadas (N:N)
+    company_ids: Optional[List[int]] = None  # Lista de IDs de empresas
+    company_roles: Optional[dict] = None  # {company_id: role}
+
+class CustomerUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    notifications_enabled: Optional[bool] = None
+    language: Optional[str] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+    # Empresas asociadas (N:N)
+    company_ids: Optional[List[int]] = None
+    company_roles: Optional[dict] = None
+
+# Operator-Company relationship
+class OperatorCompanyCreate(BaseModel):
+    operator_id: int
+    company_id: int
+    role: Optional[str] = "employee"  # employee, contractor, owner, viewer
+
+# Operator-Device permissions
+class OperatorDeviceCreate(BaseModel):
+    operator_id: int
+    device_id: int
+    granted_by_company_id: Optional[int] = None
+    can_view: Optional[bool] = True
+    can_control: Optional[bool] = False
+    receive_notifications: Optional[bool] = True
+    receive_alerts: Optional[bool] = True
+    relay_mask: Optional[str] = "1111"
+    di_mask: Optional[str] = "1111111"
+
+# Device-Company relationship
+class DeviceCompanyCreate(BaseModel):
+    device_id: int
+    company_id: int
+    relation: str = "viewer"  # owner, contractor, client, viewer
+    can_view: Optional[bool] = True
+    can_control: Optional[bool] = False
+    can_delegate: Optional[bool] = False
+    relay_mask: Optional[str] = "1111"
+    di_mask: Optional[str] = "1111111"
+
+# Company Contract (subcontratación)
+class CompanyContractCreate(BaseModel):
+    client_company_id: int
+    contractor_company_id: int
+    scope: Optional[str] = "all_devices"
+    inherit_view: Optional[bool] = True
+    inherit_notifications: Optional[bool] = True
+    inherit_control: Optional[bool] = False
+
+# Device Models
+class DeviceCreate(BaseModel):
+    device_id: str
+    company_id: Optional[int] = None
+    name: Optional[str] = None
+    location: Optional[str] = None
+    model: Optional[str] = "T-SIM7070G"
+    firmware_version: Optional[str] = None
+    imei: Optional[str] = None
+    mac_address: Optional[str] = None
+    sim_number: Optional[str] = None
+    sim_carrier: Optional[str] = None
+    relay_count: Optional[int] = 4
+    relay_labels: Optional[List[str]] = None
+    input_count: Optional[int] = 7
+    input_labels: Optional[List[str]] = None
+    alert_config: Optional[dict] = None  # {"relay_alerts": [bool], "input_alerts": [bool]}
+    alert_escalation_enabled: Optional[bool] = True
+    escalation_time_1: Optional[int] = 7200  # seconds (2h default)
+    escalation_time_2: Optional[int] = 7200  # seconds (2h default)
+    liveness_enabled: Optional[bool] = True
+    liveness_threshold_hours: Optional[int] = 1
+    liveness_ping_timeout_seconds: Optional[int] = 180
+    liveness_alert_cooldown_hours: Optional[int] = 4
+    alert_temp_enabled: Optional[bool] = False
+    alert_temp_min: Optional[float] = 23.0
+    alert_temp_max: Optional[float] = 45.0
+    alert_hum_enabled: Optional[bool] = False
+    alert_hum_min: Optional[float] = 20.0
+    alert_hum_max: Optional[float] = 90.0
+    notes: Optional[str] = None
+    status: Optional[str] = "active"
+
+class DeviceUpdate(BaseModel):
+    company_id: Optional[int] = None
+    name: Optional[str] = None
+    location: Optional[str] = None
+    model: Optional[str] = None
+    firmware_version: Optional[str] = None
+    imei: Optional[str] = None
+    mac_address: Optional[str] = None
+    sim_number: Optional[str] = None
+    sim_carrier: Optional[str] = None
+    relay_count: Optional[int] = None
+    relay_labels: Optional[List[str]] = None
+    input_count: Optional[int] = None
+    input_labels: Optional[List[str]] = None
+    alert_config: Optional[dict] = None  # {"relay_alerts": [bool], "input_alerts": [bool]}
+    alert_escalation_enabled: Optional[bool] = None
+    escalation_time_1: Optional[int] = None  # seconds
+    escalation_time_2: Optional[int] = None  # seconds
+    liveness_enabled: Optional[bool] = None
+    liveness_threshold_hours: Optional[int] = None
+    liveness_ping_timeout_seconds: Optional[int] = None
+    liveness_alert_cooldown_hours: Optional[int] = None
+    alert_temp_enabled: Optional[bool] = None
+    alert_temp_min: Optional[float] = None
+    alert_temp_max: Optional[float] = None
+    alert_hum_enabled: Optional[bool] = None
+    alert_hum_min: Optional[float] = None
+    alert_hum_max: Optional[float] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+
+# Threshold Model for per-device alert thresholds
+class DeviceThresholds(BaseModel):
+    temp_min: Optional[float] = None
+    temp_max: Optional[float] = None
+    hum_min: Optional[float] = None
+    hum_max: Optional[float] = None
+    batt_min: Optional[float] = None
+    batt_max: Optional[float] = None
+    volt_min: Optional[int] = None
+    volt_max: Optional[int] = None
+
+# Permission Model
+class PermissionCreate(BaseModel):
+    customer_id: int
+    device_id: int
+    can_view: Optional[bool] = True
+    can_control: Optional[bool] = True
+    can_configure: Optional[bool] = False
+    receive_alerts: Optional[bool] = True
+
+# Config Model
+class ConfigUpdate(BaseModel):
+    config_key: str
+    config_value: str
+
+# Message Model
+class MessageSend(BaseModel):
+    phone: str
+    message: str
+
+# Bulk Message Model
+class BulkMessageSend(BaseModel):
+    phones: List[str]  # Lista de números de teléfono
+    message: str
+    delay_ms: Optional[int] = 500  # Delay entre mensajes para no saturar
+
+# Admin User Models
+class AdminUserCreate(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    role: Optional[str] = "viewer"
+    company_id: Optional[int] = None  # Required for 'empresa' role
+
+class AdminUserUpdate(BaseModel):
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+    company_id: Optional[int] = None  # Required for 'empresa' role
+
+class AdminPasswordChange(BaseModel):
+    new_password: str
+
+
+# === AUTHENTICATION ===
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """Verify JWT token and check if user is still active."""
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+
+        # Check if user is still active in DB (real-time verification)
+        username = payload.get("sub")
+        if username:
+            conn = None
+            cursor = None
+            try:
+                conn = db.get_connection()
+                if conn:
+                    cursor = conn.cursor(dictionary=True, buffered=True)
+                    cursor.execute(
+                        "SELECT is_active FROM admin_users WHERE username = %s",
+                        (username,)
+                    )
+                    user = cursor.fetchone()
+                    if not user or not user.get('is_active'):
+                        raise HTTPException(status_code=401, detail="Usuario desactivado")
+            except HTTPException:
+                raise
+            except Exception:
+                pass  # If DB check fails, allow token (fail-open for resilience)
+            finally:
+                if cursor: cursor.close()
+                if conn: conn.close()
+
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+def verify_token_from_query(token: str = None) -> dict:
+    """Verify JWT token passed as query parameter (for PDF downloads)."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+
+        # Check if user is still active in DB
+        username = payload.get("sub")
+        if username:
+            conn = None
+            cursor = None
+            try:
+                conn = db.get_connection()
+                if conn:
+                    cursor = conn.cursor(dictionary=True, buffered=True)
+                    cursor.execute(
+                        "SELECT is_active FROM admin_users WHERE username = %s",
+                        (username,)
+                    )
+                    user = cursor.fetchone()
+                    if not user or not user.get('is_active'):
+                        raise HTTPException(status_code=401, detail="Usuario desactivado")
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+            finally:
+                if cursor: cursor.close()
+                if conn: conn.close()
+
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+
+def create_token(username: str, role: str = None, company_id: int = None) -> tuple[str, datetime]:
+    expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+    payload = {
+        "sub": username,
+        "exp": expires,
+        "iat": datetime.utcnow(),
+        "role": role,
+        "company_id": company_id
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return token, expires
+
+
+def get_user_company_filter(user: dict) -> int:
+    """Get company_id filter for 'empresa' role users. Returns None for other roles."""
+    if user.get("role") == "empresa":
+        return user.get("company_id")
+    return None
+
+
+def is_empresa_user(user: dict) -> bool:
+    """Check if user has 'empresa' role."""
+    return user.get("role") == "empresa"
+
+
+# === AUTH ENDPOINTS ===
+
+def authenticate_admin(username: str, password: str) -> dict:
+    """Authenticate admin user against database. Returns user dict or None."""
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    conn = None
+    cursor = None
+    try:
+        conn = db.get_connection()
+        if conn is None:
+            return None
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        cursor.execute(
+            """SELECT id, username, password_hash, email, full_name, role, is_active,
+                      must_change_password, login_attempts, locked_until, company_id
+               FROM admin_users WHERE username = %s""",
+            (username,)
+        )
+        user = cursor.fetchone()
+
+        if not user:
+            return None
+
+        # Check if account is locked
+        if user.get('locked_until'):
+            if datetime.utcnow() < user['locked_until']:
+                return None
+
+        # Check if account is active
+        if not user.get('is_active'):
+            return None
+
+        # Verify password
+        if user['password_hash'] != password_hash:
+            # Increment login attempts
+            cursor.execute(
+                "UPDATE admin_users SET login_attempts = login_attempts + 1 WHERE id = %s",
+                (user['id'],)
+            )
+            # Lock after 5 failed attempts
+            if user.get('login_attempts', 0) >= 4:
+                cursor.execute(
+                    "UPDATE admin_users SET locked_until = %s WHERE id = %s",
+                    (datetime.utcnow() + timedelta(minutes=15), user['id'])
+                )
+            conn.commit()
+            return None
+
+        # Successful login - reset attempts and update last_login
+        cursor.execute(
+            """UPDATE admin_users SET login_attempts = 0, locked_until = NULL,
+               last_login = %s WHERE id = %s""",
+            (datetime.utcnow(), user['id'])
+        )
+        conn.commit()
+
+        return {
+            'id': user['id'],
+            'username': user['username'],
+            'email': user.get('email'),
+            'full_name': user.get('full_name'),
+            'role': user['role'],
+            'company_id': user.get('company_id'),
+            'must_change_password': bool(user.get('must_change_password', False))
+        }
+    except Exception as e:
+        logging.error(f"[ADMIN] Auth error: {e}")
+        return None
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+@router.post("/login", response_model=LoginResponse)
+async def login(request: LoginRequest):
+    user = authenticate_admin(request.username, request.password)
+    if not user:
+        logging.warning(f"[ADMIN] Failed login: {request.username}")
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+
+    token, expires = create_token(user['username'], user.get('role'), user.get('company_id'))
+    must_change = user.get('must_change_password', False)
+    logging.info(f"[ADMIN] Login: {user['username']} (role: {user['role']}, company_id: {user.get('company_id')}, must_change: {must_change})")
+    return LoginResponse(token=token, expires_at=expires.isoformat(), must_change_password=must_change)
+
+@router.get("/verify")
+async def verify_session(user: dict = Depends(verify_token)):
+    return {"valid": True, "user": user.get("sub")}
+
+
+# === HELPER FUNCTIONS ===
+
+def execute_query(query: str, params: tuple = None, fetch: str = "all"):
+    """Execute a query and return results."""
+    conn = None
+    cursor = None
+    try:
+        conn = db.get_connection()
+        if conn is None:
+            raise HTTPException(status_code=500, detail="Error de conexión a base de datos")
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        cursor.execute(query, params)
+
+        if fetch == "one":
+            result = cursor.fetchone()
+        elif fetch == "all":
+            result = cursor.fetchall()
+        else:
+            conn.commit()
+            result = {"affected_rows": cursor.rowcount, "last_id": cursor.lastrowid}
+
+        return result
+    except Exception as e:
+        logging.error(f"[ADMIN] Query error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+def convert_datetime(rows):
+    """Convert datetime objects to ISO strings for JSON."""
+    if isinstance(rows, list):
+        for row in rows:
+            for key, value in row.items():
+                if isinstance(value, datetime):
+                    row[key] = value.isoformat()
+    elif isinstance(rows, dict):
+        for key, value in rows.items():
+            if isinstance(value, datetime):
+                rows[key] = value.isoformat()
+    return rows
+
+
+# === COMPANIES ENDPOINTS ===
+
+@router.get("/companies")
+async def list_companies(user: dict = Depends(verify_token)):
+    company_filter = get_user_company_filter(user)
+    if company_filter:
+        # Empresa user: only their company
+        query = "SELECT * FROM company WHERE id = %s ORDER BY name"
+        rows = execute_query(query, (company_filter,))
+    else:
+        query = "SELECT * FROM company ORDER BY name"
+        rows = execute_query(query)
+    return {"companies": convert_datetime(rows) if rows else []}
+
+@router.get("/companies/{id}")
+async def get_company(id: int, user: dict = Depends(verify_token)):
+    # Empresa users can only view their own company
+    company_filter = get_user_company_filter(user)
+    if company_filter and company_filter != id:
+        raise HTTPException(status_code=403, detail="No tiene acceso a esta empresa")
+    row = execute_query("SELECT * FROM company WHERE id = %s", (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Empresa no encontrada")
+    return convert_datetime(row)
+
+@router.post("/companies")
+async def create_company(company: CompanyCreate, user: dict = Depends(verify_token)):
+    # Empresa users cannot create companies
+    if is_empresa_user(user):
+        raise HTTPException(status_code=403, detail="No tiene permiso para crear empresas")
+    query = """INSERT INTO company (name, tax_id, address, city, province, country, phone, email, contact_person, notification_phone, notes, status)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (
+        company.name, company.tax_id, company.address, company.city, company.province,
+        company.country, company.phone, company.email, company.contact_person, company.notification_phone,
+        company.notes, company.status
+    ), "commit")
+    logging.info(f"[ADMIN] Company created: {company.name}")
+    return {"success": True, "id": result["last_id"], "message": f"Empresa '{company.name}' creada"}
+
+@router.put("/companies/{id}")
+async def update_company(id: int, company: CompanyUpdate, user: dict = Depends(verify_token)):
+    # Empresa users can only update their own company
+    company_filter = get_user_company_filter(user)
+    if company_filter and company_filter != id:
+        raise HTTPException(status_code=403, detail="No tiene permiso para modificar esta empresa")
+    updates, values = [], []
+    for field, value in company.dict(exclude_unset=True).items():
+        if value is not None:
+            updates.append(f"{field} = %s")
+            values.append(value)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+    values.append(id)
+    result = execute_query(f"UPDATE company SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Empresa no encontrada")
+    return {"success": True, "message": "Empresa actualizada"}
+
+@router.delete("/companies/{id}")
+async def delete_company(id: int, user: dict = Depends(verify_token)):
+    # Empresa users cannot delete companies
+    if is_empresa_user(user):
+        raise HTTPException(status_code=403, detail="No tiene permiso para eliminar empresas")
+    result = execute_query("DELETE FROM company WHERE id = %s", (id,), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Empresa no encontrada")
+    return {"success": True, "message": "Empresa eliminada"}
+
+
+# === CUSTOMERS/OPERATORS ENDPOINTS ===
+
+@router.get("/customers")
+async def list_customers(user: dict = Depends(verify_token)):
+    """List all operators with their associated companies (N:N)."""
+    company_filter = get_user_company_filter(user)
+    if company_filter:
+        # Empresa user: only operators linked to their company
+        query = """SELECT c.id, c.first_name, c.last_name, c.phone, c.email,
+                          c.notifications_enabled, c.language, c.notes, c.status,
+                          c.created_at, c.updated_at,
+                          GROUP_CONCAT(DISTINCT co.id) as company_ids,
+                          GROUP_CONCAT(DISTINCT co.name SEPARATOR ', ') as company_names
+                   FROM customer c
+                   JOIN operator_company oc ON c.id = oc.operator_id AND oc.is_active = 1
+                   JOIN company co ON oc.company_id = co.id
+                   WHERE oc.company_id = %s
+                   GROUP BY c.id
+                   ORDER BY c.last_name, c.first_name"""
+        rows = execute_query(query, (company_filter,))
+    else:
+        query = """SELECT c.id, c.first_name, c.last_name, c.phone, c.email,
+                          c.notifications_enabled, c.language, c.notes, c.status,
+                          c.created_at, c.updated_at,
+                          GROUP_CONCAT(DISTINCT co.id) as company_ids,
+                          GROUP_CONCAT(DISTINCT co.name SEPARATOR ', ') as company_names
+                   FROM customer c
+                   LEFT JOIN operator_company oc ON c.id = oc.operator_id AND oc.is_active = 1
+                   LEFT JOIN company co ON oc.company_id = co.id
+                   GROUP BY c.id
+                   ORDER BY c.last_name, c.first_name"""
+        rows = execute_query(query)
+    return {"customers": convert_datetime(rows) if rows else []}
+
+@router.get("/customers/by-company/{company_id}")
+async def list_customers_by_company(company_id: int, user: dict = Depends(verify_token)):
+    """Get all operators for a specific company (via operator_company N:N)."""
+    # Empresa users can only query their own company
+    company_filter = get_user_company_filter(user)
+    if company_filter and company_filter != company_id:
+        raise HTTPException(status_code=403, detail="No tiene acceso a esta empresa")
+    query = """SELECT c.id, c.first_name, c.last_name, c.phone, c.email,
+                      c.notifications_enabled, c.language, c.notes, c.status,
+                      c.created_at, c.updated_at, oc.role as company_role,
+                      %s as company_id
+               FROM customer c
+               JOIN operator_company oc ON c.id = oc.operator_id
+               WHERE oc.company_id = %s AND oc.is_active = 1
+               ORDER BY c.last_name, c.first_name"""
+    rows = execute_query(query, (company_id, company_id))
+    return {"customers": convert_datetime(rows) if rows else []}
+
+
+@router.get("/customers/{id}")
+async def get_customer(id: int, user: dict = Depends(verify_token)):
+    """Get single operator with all associated companies."""
+    query = """SELECT c.id, c.first_name, c.last_name, c.phone, c.email,
+                      c.notifications_enabled, c.language, c.notes, c.status,
+                      c.created_at, c.updated_at
+               FROM customer c
+               WHERE c.id = %s"""
+    row = execute_query(query, (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Operador no encontrado")
+
+    # Get associated companies
+    companies_query = """SELECT co.id, co.name, oc.role, oc.hired_at
+                         FROM operator_company oc
+                         JOIN company co ON oc.company_id = co.id
+                         WHERE oc.operator_id = %s AND oc.is_active = 1"""
+    companies = execute_query(companies_query, (id,))
+
+    result = convert_datetime(row)
+    result['companies'] = convert_datetime(companies) if companies else []
+    result['company_ids'] = [c['id'] for c in result['companies']]
+    return result
+
+@router.post("/customers")
+async def create_customer(customer: CustomerCreate, user: dict = Depends(verify_token)):
+    """Create operator and associate with companies (N:N)."""
+    # Insert customer (without company_id - use operator_company instead)
+    query = """INSERT INTO customer (first_name, last_name, phone, email, notifications_enabled, language, notes, status)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (
+        customer.first_name, customer.last_name, customer.phone,
+        customer.email, customer.notifications_enabled, customer.language,
+        customer.notes, customer.status
+    ), "commit")
+
+    operator_id = result["last_id"]
+
+    # Associate with companies if provided
+    if customer.company_ids:
+        for company_id in customer.company_ids:
+            role = customer.company_roles.get(str(company_id), "employee") if customer.company_roles else "employee"
+            execute_query(
+                """INSERT INTO operator_company (operator_id, company_id, role) VALUES (%s, %s, %s)
+                   ON DUPLICATE KEY UPDATE role = %s, is_active = 1""",
+                (operator_id, company_id, role, role), "commit"
+            )
+
+    logging.info(f"[ADMIN] Operator created: {customer.first_name} {customer.last_name} (companies: {customer.company_ids})")
+    return {"success": True, "id": operator_id, "message": f"Operador '{customer.first_name} {customer.last_name}' creado"}
+
+@router.put("/customers/{id}")
+async def update_customer(id: int, customer: CustomerUpdate, user: dict = Depends(verify_token)):
+    """Update operator and company associations."""
+    # First verify the operator exists
+    exists = execute_query("SELECT id FROM customer WHERE id = %s", (id,), "one")
+    if not exists:
+        raise HTTPException(status_code=404, detail="Operador no encontrado")
+
+    # Update basic fields
+    basic_fields = ['first_name', 'last_name', 'email', 'notifications_enabled', 'language', 'notes', 'status']
+    updates, values = [], []
+    data = customer.dict(exclude_unset=True)
+
+    for field in basic_fields:
+        if field in data and data[field] is not None:
+            updates.append(f"{field} = %s")
+            values.append(data[field])
+
+    if updates:
+        values.append(id)
+        execute_query(f"UPDATE customer SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+
+    # Update company associations if provided
+    if customer.company_ids is not None:
+        # Deactivate all current associations
+        execute_query("UPDATE operator_company SET is_active = 0 WHERE operator_id = %s", (id,), "commit")
+
+        # Add/reactivate new associations
+        for company_id in customer.company_ids:
+            role = customer.company_roles.get(str(company_id), "employee") if customer.company_roles else "employee"
+            execute_query(
+                """INSERT INTO operator_company (operator_id, company_id, role, is_active)
+                   VALUES (%s, %s, %s, 1)
+                   ON DUPLICATE KEY UPDATE role = %s, is_active = 1""",
+                (id, company_id, role, role), "commit"
+            )
+
+    return {"success": True, "message": "Operador actualizado"}
+
+@router.delete("/customers/{id}")
+async def delete_customer(id: int, user: dict = Depends(verify_token)):
+    """Delete operator (cascades to operator_company, operator_device)."""
+    result = execute_query("DELETE FROM customer WHERE id = %s", (id,), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Operador no encontrado")
+    return {"success": True, "message": "Operador eliminado"}
+
+
+# === OPERATOR-COMPANY RELATIONSHIPS ===
+
+@router.get("/operator-companies/{operator_id}")
+async def get_operator_companies(operator_id: int, user: dict = Depends(verify_token)):
+    """Get all companies for an operator."""
+    query = """SELECT oc.*, co.name as company_name
+               FROM operator_company oc
+               JOIN company co ON oc.company_id = co.id
+               WHERE oc.operator_id = %s AND oc.is_active = 1"""
+    rows = execute_query(query, (operator_id,))
+    return {"companies": convert_datetime(rows) if rows else []}
+
+@router.post("/operator-companies")
+async def add_operator_company(data: OperatorCompanyCreate, user: dict = Depends(verify_token)):
+    """Add operator to a company."""
+    query = """INSERT INTO operator_company (operator_id, company_id, role)
+               VALUES (%s, %s, %s)
+               ON DUPLICATE KEY UPDATE role = %s, is_active = 1"""
+    execute_query(query, (data.operator_id, data.company_id, data.role, data.role), "commit")
+    return {"success": True, "message": "Operador asociado a empresa"}
+
+@router.delete("/operator-companies/{operator_id}/{company_id}")
+async def remove_operator_company(operator_id: int, company_id: int, user: dict = Depends(verify_token)):
+    """Remove operator from a company (soft delete)."""
+    execute_query(
+        "UPDATE operator_company SET is_active = 0 WHERE operator_id = %s AND company_id = %s",
+        (operator_id, company_id), "commit"
+    )
+    return {"success": True, "message": "Operador desvinculado de empresa"}
+
+
+# === OPERATOR-DEVICE PERMISSIONS ===
+
+@router.get("/operator-devices/{operator_id}")
+async def get_operator_devices(operator_id: int, user: dict = Depends(verify_token)):
+    """Get all device permissions for an operator."""
+    query = """SELECT od.*, h.client_id, h.alias as device_alias, co.name as granted_by_company
+               FROM operator_device od
+               JOIN hardware h ON od.device_id = h.id
+               LEFT JOIN company co ON od.granted_by_company_id = co.id
+               WHERE od.operator_id = %s AND od.is_active = 1"""
+    rows = execute_query(query, (operator_id,))
+    return {"devices": convert_datetime(rows) if rows else []}
+
+@router.post("/operator-devices")
+async def add_operator_device(data: OperatorDeviceCreate, user: dict = Depends(verify_token)):
+    """Grant device permissions to an operator."""
+    query = """INSERT INTO operator_device (operator_id, device_id, granted_by_company_id,
+               can_view, can_control, receive_notifications, receive_alerts, relay_mask, di_mask)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE can_view = %s, can_control = %s, receive_notifications = %s,
+               receive_alerts = %s, relay_mask = %s, di_mask = %s, is_active = 1"""
+    execute_query(query, (
+        data.operator_id, data.device_id, data.granted_by_company_id,
+        data.can_view, data.can_control, data.receive_notifications, data.receive_alerts, data.relay_mask, data.di_mask,
+        data.can_view, data.can_control, data.receive_notifications, data.receive_alerts, data.relay_mask, data.di_mask
+    ), "commit")
+    return {"success": True, "message": "Permisos de dispositivo otorgados"}
+
+@router.delete("/operator-devices/{operator_id}/{device_id}")
+async def remove_operator_device(operator_id: int, device_id: int, user: dict = Depends(verify_token)):
+    """Revoke device permissions from an operator (soft delete)."""
+    execute_query(
+        "UPDATE operator_device SET is_active = 0 WHERE operator_id = %s AND device_id = %s",
+        (operator_id, device_id), "commit"
+    )
+    return {"success": True, "message": "Permisos de dispositivo revocados"}
+
+
+@router.get("/company-permissions/{company_id}")
+async def get_company_permissions(company_id: int, user: dict = Depends(verify_token)):
+    """Get all operator-device permissions for a company.
+    Returns permissions granted by this company to its operators."""
+    query = """SELECT od.id, od.operator_id, od.device_id, od.can_view, od.can_control,
+               od.receive_notifications, od.receive_alerts, od.relay_mask, od.di_mask,
+               c.first_name, c.last_name, c.phone as operator_phone,
+               h.client_id as device_client_id, COALESCE(h.alias, h.name) as device_name
+               FROM operator_device od
+               JOIN customer c ON od.operator_id = c.id
+               JOIN hardware h ON od.device_id = h.id
+               WHERE od.granted_by_company_id = %s AND od.is_active = 1
+               ORDER BY c.first_name, c.last_name, h.alias"""
+    rows = execute_query(query, (company_id,))
+    return {"permissions": convert_datetime(rows) if rows else []}
+
+
+# === DEVICE-COMPANY RELATIONSHIPS ===
+
+@router.get("/device-companies/{device_id}")
+async def get_device_companies(device_id: int, user: dict = Depends(verify_token)):
+    """Get all companies with access to a device."""
+    query = """SELECT dc.*, co.name as company_name
+               FROM device_company dc
+               JOIN company co ON dc.company_id = co.id
+               WHERE dc.device_id = %s AND dc.is_active = 1"""
+    rows = execute_query(query, (device_id,))
+    return {"companies": convert_datetime(rows) if rows else []}
+
+@router.post("/device-companies")
+async def add_device_company(data: DeviceCompanyCreate, user: dict = Depends(verify_token)):
+    """Grant company access to a device."""
+    query = """INSERT INTO device_company (device_id, company_id, relation, can_view, can_control, can_delegate, relay_mask, di_mask)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE relation = %s, can_view = %s, can_control = %s, can_delegate = %s,
+               relay_mask = %s, di_mask = %s, is_active = 1"""
+    execute_query(query, (
+        data.device_id, data.company_id, data.relation, data.can_view, data.can_control, data.can_delegate, data.relay_mask, data.di_mask,
+        data.relation, data.can_view, data.can_control, data.can_delegate, data.relay_mask, data.di_mask
+    ), "commit")
+    return {"success": True, "message": "Empresa asociada a dispositivo"}
+
+@router.delete("/device-companies/{device_id}/{company_id}")
+async def remove_device_company(device_id: int, company_id: int, user: dict = Depends(verify_token)):
+    """Remove company access to device (soft delete)."""
+    execute_query(
+        "UPDATE device_company SET is_active = 0 WHERE device_id = %s AND company_id = %s",
+        (device_id, company_id), "commit"
+    )
+    return {"success": True, "message": "Acceso de empresa revocado"}
+
+
+# === COMPANY CONTRACTS (subcontratación) ===
+
+@router.get("/company-contracts")
+async def list_company_contracts(client_company_id: Optional[str] = None, contractor_company_id: Optional[str] = None, user: dict = Depends(verify_token)):
+    """List company contracts with optional filters."""
+    query = """SELECT cc.*,
+                      client.name as client_name,
+                      contractor.name as contractor_name
+               FROM company_contract cc
+               JOIN company client ON cc.client_company_id = client.id
+               JOIN company contractor ON cc.contractor_company_id = contractor.id
+               WHERE cc.is_active = 1"""
+    params = []
+
+    if client_company_id and client_company_id.isdigit():
+        query += " AND cc.client_company_id = %s"
+        params.append(int(client_company_id))
+    if contractor_company_id and contractor_company_id.isdigit():
+        query += " AND cc.contractor_company_id = %s"
+        params.append(int(contractor_company_id))
+
+    rows = execute_query(query, tuple(params) if params else None)
+    return convert_datetime(rows) if rows else []
+
+@router.get("/company-contracts/by-company/{company_id}")
+async def get_company_contracts(company_id: int, user: dict = Depends(verify_token)):
+    """Get all contracts for a company (as client or contractor)."""
+    query = """SELECT cc.*,
+                      client.name as client_name,
+                      contractor.name as contractor_name
+               FROM company_contract cc
+               JOIN company client ON cc.client_company_id = client.id
+               JOIN company contractor ON cc.contractor_company_id = contractor.id
+               WHERE (cc.client_company_id = %s OR cc.contractor_company_id = %s) AND cc.is_active = 1"""
+    rows = execute_query(query, (company_id, company_id))
+    return {"contracts": convert_datetime(rows) if rows else []}
+
+@router.post("/company-contracts")
+async def create_company_contract(data: CompanyContractCreate, user: dict = Depends(verify_token)):
+    """Create a contract between companies."""
+    query = """INSERT INTO company_contract (client_company_id, contractor_company_id, scope, inherit_view, inherit_notifications, inherit_control)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE scope = %s, inherit_view = %s, inherit_notifications = %s, inherit_control = %s, is_active = 1"""
+    execute_query(query, (
+        data.client_company_id, data.contractor_company_id, data.scope, data.inherit_view, data.inherit_notifications, data.inherit_control,
+        data.scope, data.inherit_view, data.inherit_notifications, data.inherit_control
+    ), "commit")
+    # Return the created/updated contract
+    result = execute_query(
+        "SELECT id FROM company_contract WHERE client_company_id = %s AND contractor_company_id = %s",
+        (data.client_company_id, data.contractor_company_id), "one"
+    )
+    return {"success": True, "id": result['id'] if result else None, "message": "Contrato creado"}
+
+@router.delete("/company-contracts/{contract_id}")
+async def delete_company_contract(contract_id: int, user: dict = Depends(verify_token)):
+    """Terminate a contract by ID (soft delete)."""
+    execute_query(
+        "UPDATE company_contract SET is_active = 0 WHERE id = %s",
+        (contract_id,), "commit"
+    )
+    return {"success": True, "message": "Contrato terminado"}
+
+
+# === DEVICES ENDPOINTS (New schema) ===
+
+@router.get("/devices/full")
+async def list_devices_full(user: dict = Depends(verify_token)):
+    company_filter = get_user_company_filter(user)
+    if company_filter:
+        query = """SELECT d.*, c.name as company_name
+                   FROM hardware d
+                   LEFT JOIN company c ON d.company_id = c.id
+                   WHERE d.company_id = %s
+                   ORDER BY d.name"""
+        rows = execute_query(query, (company_filter,))
+    else:
+        query = """SELECT d.*, c.name as company_name
+                   FROM hardware d
+                   LEFT JOIN company c ON d.company_id = c.id
+                   ORDER BY d.name"""
+        rows = execute_query(query)
+    devices = convert_datetime(rows) if rows else []
+
+    # Add online status from MQTT cache and parse JSON fields
+    for device in devices:
+        state = mqtt_handler.get_device_state(device.get("client_id"))
+        device["online"] = state is not None
+        if state:
+            device["last_seen_live"] = state.get("timestamp")
+            device["relays"] = state.get("relays", [0, 0, 0, 0])
+
+        # Parse JSON labels to arrays for frontend
+        if device.get('relay_labels') and isinstance(device['relay_labels'], str):
+            try:
+                device['relay_labels'] = json.loads(device['relay_labels'])
+            except:
+                pass
+        if device.get('input_labels') and isinstance(device['input_labels'], str):
+            try:
+                device['input_labels'] = json.loads(device['input_labels'])
+            except:
+                pass
+        if device.get('alert_config') and isinstance(device['alert_config'], str):
+            try:
+                device['alert_config'] = json.loads(device['alert_config'])
+            except:
+                pass
+
+    return {"devices": devices}
+
+@router.get("/devices/by-company/{company_id}")
+async def list_devices_by_company(company_id: int, user: dict = Depends(verify_token)):
+    """Get all devices for a specific company."""
+    # Empresa users can only query their own company
+    company_filter = get_user_company_filter(user)
+    if company_filter and company_filter != company_id:
+        raise HTTPException(status_code=403, detail="No tiene acceso a esta empresa")
+    query = """SELECT d.*, c.name as company_name
+               FROM hardware d
+               LEFT JOIN company c ON d.company_id = c.id
+               WHERE d.company_id = %s
+               ORDER BY d.name"""
+    rows = execute_query(query, (company_id,))
+    devices = convert_datetime(rows) if rows else []
+
+    # Add online status from MQTT cache and parse JSON fields
+    for device in devices:
+        state = mqtt_handler.get_device_state(device.get("client_id"))
+        device["online"] = state is not None
+        if state:
+            device["last_seen_live"] = state.get("timestamp")
+            device["relays"] = state.get("relays", [0, 0, 0, 0])
+
+        # Parse JSON labels to arrays for frontend
+        if device.get('relay_labels') and isinstance(device['relay_labels'], str):
+            try:
+                device['relay_labels'] = json.loads(device['relay_labels'])
+            except:
+                pass
+        if device.get('input_labels') and isinstance(device['input_labels'], str):
+            try:
+                device['input_labels'] = json.loads(device['input_labels'])
+            except:
+                pass
+        if device.get('alert_config') and isinstance(device['alert_config'], str):
+            try:
+                device['alert_config'] = json.loads(device['alert_config'])
+            except:
+                pass
+
+    return {"devices": devices}
+
+
+@router.get("/devices/full/{id}")
+async def get_device_full(id: int, user: dict = Depends(verify_token)):
+    query = """SELECT d.*, c.name as company_name
+               FROM hardware d
+               LEFT JOIN company c ON d.company_id = c.id
+               WHERE d.id = %s"""
+    row = execute_query(query, (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+    result = convert_datetime(row)
+    # Parse JSON labels to arrays for frontend
+    if result.get('relay_labels') and isinstance(result['relay_labels'], str):
+        try:
+            result['relay_labels'] = json.loads(result['relay_labels'])
+        except:
+            pass
+    if result.get('input_labels') and isinstance(result['input_labels'], str):
+        try:
+            result['input_labels'] = json.loads(result['input_labels'])
+        except:
+            pass
+    # Parse alert_config JSON
+    if result.get('alert_config') and isinstance(result['alert_config'], str):
+        try:
+            result['alert_config'] = json.loads(result['alert_config'])
+        except:
+            pass
+    return result
+
+@router.post("/devices/full")
+async def create_device_full(device: DeviceCreate, user: dict = Depends(verify_token)):
+    query = """INSERT INTO hardware (client_id, company_id, name, location, model, firmware_version, imei, mac_address,
+               sim_number, sim_carrier, relay_count, relay_labels, input_count, input_labels, notes, status,
+               alert_escalation_enabled, escalation_time_1, escalation_time_2,
+               liveness_enabled, liveness_threshold_hours, liveness_ping_timeout_seconds, liveness_alert_cooldown_hours,
+               alert_temp_enabled, alert_temp_min, alert_temp_max, alert_hum_enabled, alert_hum_min, alert_hum_max)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (
+        device.device_id, device.company_id, device.name, device.location, device.model,
+        device.firmware_version, device.imei, device.mac_address, device.sim_number, device.sim_carrier,
+        device.relay_count, json.dumps(device.relay_labels) if device.relay_labels else None,
+        device.input_count, json.dumps(device.input_labels) if device.input_labels else None,
+        device.notes, device.status,
+        1 if device.alert_escalation_enabled else 0, device.escalation_time_1, device.escalation_time_2,
+        1 if device.liveness_enabled else 0, device.liveness_threshold_hours,
+        device.liveness_ping_timeout_seconds, device.liveness_alert_cooldown_hours,
+        1 if device.alert_temp_enabled else 0, device.alert_temp_min, device.alert_temp_max,
+        1 if device.alert_hum_enabled else 0, device.alert_hum_min, device.alert_hum_max
+    ), "commit")
+    logging.info(f"[ADMIN] Device created: {device.device_id}")
+    return {"success": True, "id": result["last_id"], "message": f"Dispositivo '{device.device_id}' creado"}
+
+@router.put("/devices/full/{id}")
+async def update_device_full(id: int, device: DeviceUpdate, user: dict = Depends(verify_token)):
+    updates, values = [], []
+    for field, value in device.dict(exclude_unset=True).items():
+        if value is not None:
+            if field in ['relay_labels', 'input_labels', 'alert_config']:
+                value = json.dumps(value) if value else None
+            elif field in ['alert_escalation_enabled', 'liveness_enabled', 'alert_temp_enabled', 'alert_hum_enabled']:
+                value = 1 if value else 0
+            updates.append(f"{field} = %s")
+            values.append(value)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+    values.append(id)
+    result = execute_query(f"UPDATE hardware SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+    return {"success": True, "message": "Dispositivo actualizado"}
+
+@router.delete("/devices/full/{id}")
+async def delete_device_full(id: int, user: dict = Depends(verify_token)):
+    result = execute_query("DELETE FROM hardware WHERE id = %s", (id,), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+    return {"success": True, "message": "Dispositivo eliminado"}
+
+
+@router.put("/devices/{device_id}/thresholds")
+async def update_device_thresholds(device_id: str, thresholds: DeviceThresholds, user: dict = Depends(verify_token)):
+    """Update alert thresholds for a device. Uses JSON merge to update existing alert_config."""
+    # Get current alert_config
+    row = execute_query("SELECT alert_config FROM hardware WHERE client_id = %s", (device_id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+
+    current_config = {}
+    if row.get("alert_config"):
+        try:
+            if isinstance(row["alert_config"], str):
+                current_config = json.loads(row["alert_config"])
+            else:
+                current_config = row["alert_config"]
+        except:
+            pass
+
+    # Merge thresholds into existing config
+    for field, value in thresholds.dict(exclude_unset=True).items():
+        if value is not None:
+            current_config[field] = value
+
+    # Save back to DB
+    result = execute_query(
+        "UPDATE hardware SET alert_config = %s WHERE client_id = %s",
+        (json.dumps(current_config), device_id),
+        "commit"
+    )
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="No se pudo actualizar")
+
+    logging.info(f"[ADMIN] Thresholds updated for {device_id}: {thresholds.dict(exclude_unset=True)}")
+    return {"success": True, "message": "Umbrales actualizados", "config": current_config}
+
+
+@router.get("/devices/{device_id}/thresholds")
+async def get_device_thresholds(device_id: str, user: dict = Depends(verify_token)):
+    """Get current alert thresholds for a device."""
+    row = execute_query("SELECT alert_config FROM hardware WHERE client_id = %s", (device_id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+
+    config = {}
+    if row.get("alert_config"):
+        try:
+            if isinstance(row["alert_config"], str):
+                config = json.loads(row["alert_config"])
+            else:
+                config = row["alert_config"]
+        except:
+            pass
+
+    # Return only threshold fields
+    thresholds = {
+        "temp_min": config.get("temp_min"),
+        "temp_max": config.get("temp_max"),
+        "hum_min": config.get("hum_min"),
+        "hum_max": config.get("hum_max"),
+        "batt_min": config.get("batt_min"),
+        "batt_max": config.get("batt_max"),
+        "volt_min": config.get("volt_min"),
+        "volt_max": config.get("volt_max"),
+    }
+    return {"device_id": device_id, "thresholds": thresholds}
+
+
+@router.get("/devices/lookup")
+async def get_device_by_client_id(client_id: str, user: dict = Depends(verify_token)):
+    """Get device info by client_id (SMART-xxx format) including labels."""
+    query = """SELECT d.*, c.name as company_name
+               FROM hardware d
+               LEFT JOIN company c ON d.company_id = c.id
+               WHERE d.client_id = %s"""
+    row = execute_query(query, (client_id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+    result = convert_datetime(row)
+    # Parse JSON labels to arrays for frontend
+    for field in ['relay_labels', 'input_labels', 'do_labels', 'di_labels', 'alert_config']:
+        if result.get(field) and isinstance(result[field], str):
+            try:
+                result[field] = json.loads(result[field])
+            except:
+                pass
+    return result
+
+
+@router.get("/device-state/{client_id}")
+async def get_device_state(client_id: str, user: dict = Depends(verify_token)):
+    """Get current device state from MQTT cache."""
+    state = mqtt_handler.get_device_state(client_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Estado no disponible")
+    return state
+
+
+# === PERMISSIONS ENDPOINTS ===
+
+@router.get("/permissions")
+async def list_permissions(user: dict = Depends(verify_token)):
+    query = """SELECT dp.*, c.first_name, c.last_name, c.phone, d.device_id, d.name as device_name
+               FROM device_permissions dp
+               JOIN customer c ON dp.customer_id = c.id
+               JOIN hardware d ON dp.device_id = d.id
+               ORDER BY c.last_name"""
+    rows = execute_query(query)
+    return {"permissions": convert_datetime(rows) if rows else []}
+
+
+@router.get("/permissions/by-company/{company_id}")
+async def list_permissions_by_company(company_id: int, user: dict = Depends(verify_token)):
+    """Get all device permissions for a specific company."""
+    query = """SELECT dp.*, c.first_name, c.last_name, c.phone, d.device_id, d.name as device_name, d.id as device_db_id
+               FROM device_permissions dp
+               JOIN customer c ON dp.customer_id = c.id
+               JOIN hardware d ON dp.device_id = d.id
+               WHERE c.company_id = %s OR d.company_id = %s
+               ORDER BY c.last_name, d.name"""
+    rows = execute_query(query, (company_id, company_id))
+    return {"permissions": convert_datetime(rows) if rows else []}
+
+@router.post("/permissions")
+async def create_permission(perm: PermissionCreate, user: dict = Depends(verify_token)):
+    query = """INSERT INTO device_permissions (customer_id, device_id, can_view, can_control, can_configure, receive_alerts)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE can_view=%s, can_control=%s, can_configure=%s, receive_alerts=%s"""
+    execute_query(query, (
+        perm.customer_id, perm.device_id, perm.can_view, perm.can_control, perm.can_configure, perm.receive_alerts,
+        perm.can_view, perm.can_control, perm.can_configure, perm.receive_alerts
+    ), "commit")
+    return {"success": True, "message": "Permiso asignado"}
+
+@router.delete("/permissions/{customer_id}/{device_id}")
+async def delete_permission(customer_id: int, device_id: int, user: dict = Depends(verify_token)):
+    result = execute_query(
+        "DELETE FROM device_permissions WHERE customer_id = %s AND device_id = %s",
+        (customer_id, device_id), "commit"
+    )
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Permiso no encontrado")
+    return {"success": True, "message": "Permiso eliminado"}
+
+
+# === SYSTEM CONFIG ENDPOINTS ===
+
+@router.get("/config")
+async def get_config(user: dict = Depends(verify_token)):
+    rows = execute_query("SELECT * FROM system_config ORDER BY config_key")
+    return {"config": rows if rows else []}
+
+@router.put("/config")
+async def update_config(config: ConfigUpdate, user: dict = Depends(verify_token)):
+    query = """INSERT INTO system_config (config_key, config_value)
+               VALUES (%s, %s)
+               ON DUPLICATE KEY UPDATE config_value = %s"""
+    execute_query(query, (config.config_key, config.config_value, config.config_value), "commit")
+    logging.info(f"[ADMIN] Config updated: {config.config_key}")
+    return {"success": True, "message": f"Configuración '{config.config_key}' actualizada"}
+
+
+# === SYSTEM STATUS ===
+
+@router.get("/status")
+async def get_system_status(user: dict = Depends(verify_token)):
+    mqtt_connected = mqtt_handler.get_client() is not None
+    # Use hardware table for device count (not wa_devices)
+    hardware_devices = execute_query("SELECT client_id FROM hardware WHERE status = 'active'")
+    hardware_list = hardware_devices if hardware_devices else []
+    online_count = sum(1 for d in hardware_list if mqtt_handler.get_device_state(d.get("client_id")))
+    return {
+        "mqtt_connected": mqtt_connected,
+        "total_devices": len(hardware_list),
+        "online_devices": online_count,
+        "cached_states": len(mqtt_handler.device_states)
+    }
+
+@router.get("/states")
+async def get_device_states(user: dict = Depends(verify_token)):
+    return {"states": mqtt_handler.device_states}
+
+
+# === MESSAGING ===
+
+@router.post("/send")
+async def send_message(msg: MessageSend, user: dict = Depends(verify_token)):
+    from . import whatsapp
+    try:
+        whatsapp.send_text(msg.phone, msg.message, mqtt_handler.get_client())
+        logging.info(f"[ADMIN] Message sent to {msg.phone}")
+        return {"success": True, "message": "Mensaje enviado"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/send-bulk")
+async def send_bulk_message(bulk: BulkMessageSend, user: dict = Depends(verify_token)):
+    """Enviar mensaje WhatsApp a múltiples destinatarios"""
+    from . import whatsapp
+    import asyncio
+
+    results = []
+    success_count = 0
+    error_count = 0
+
+    for phone in bulk.phones:
+        phone = phone.strip()
+        if not phone:
+            continue
+        try:
+            whatsapp.send_text(phone, bulk.message, mqtt_handler.get_client())
+            results.append({"phone": phone, "status": "sent"})
+            success_count += 1
+            logging.info(f"[ADMIN-BULK] Message sent to {phone}")
+        except Exception as e:
+            results.append({"phone": phone, "status": "error", "error": str(e)})
+            error_count += 1
+            logging.error(f"[ADMIN-BULK] Error sending to {phone}: {e}")
+
+        # Delay entre mensajes para no saturar la API
+        if bulk.delay_ms > 0:
+            await asyncio.sleep(bulk.delay_ms / 1000)
+
+    return {
+        "success": True,
+        "total": len(bulk.phones),
+        "sent": success_count,
+        "errors": error_count,
+        "results": results
+    }
+
+
+@router.get("/contacts-for-bulk")
+async def get_contacts_for_bulk(user: dict = Depends(verify_token)):
+    """Obtener lista de contactos con teléfono para envío masivo"""
+    query = """
+        SELECT c.id,
+               COALESCE(NULLIF(CONCAT(COALESCE(c.first_name,''), ' ', COALESCE(c.last_name,'')), ' '), c.name, 'Sin nombre') as name,
+               c.phone, c.email, co.name as company_name
+        FROM customer c
+        LEFT JOIN company co ON c.company_id = co.id
+        WHERE c.phone IS NOT NULL AND c.phone != '' AND c.is_active = 1
+        ORDER BY co.name, name
+    """
+    rows = execute_query(query)
+    return {"contacts": rows if rows else []}
+
+
+# === LOGS ===
+
+@router.get("/logs")
+async def get_logs(limit: int = 50, user: dict = Depends(verify_token)):
+    query = """SELECT * FROM wa_command_log ORDER BY created_at DESC LIMIT %s"""
+    rows = execute_query(query, (limit,))
+    return {"logs": convert_datetime(rows) if rows else []}
+
+@router.get("/alerts")
+async def get_alerts(limit: int = 50, user: dict = Depends(verify_token)):
+    query = """SELECT * FROM alert_log ORDER BY created_at DESC LIMIT %s"""
+    rows = execute_query(query, (limit,))
+    return {"alerts": convert_datetime(rows) if rows else []}
+
+
+@router.get("/alerts/active")
+async def get_active_alerts(device_id: Optional[str] = None, limit: int = 50, user: dict = Depends(verify_token)):
+    """Get active escalation alerts for a device or all devices."""
+    if device_id:
+        query = """
+            SELECT id, device_client_id, alert_type, alert_message, alert_value, alert_index,
+                   status, current_level, notification_count, created_at, last_notified_at,
+                   escalated_level2_at, escalated_level3_at,
+                   ack_level1_at, ack_level1_by, ack_level2_at, ack_level2_by, ack_level3_at, ack_level3_by
+            FROM alert_escalation
+            WHERE device_client_id = %s
+              AND status IN ('active', 'ack_level_1', 'ack_level_2', 'ack_level_3')
+            ORDER BY created_at DESC LIMIT %s
+        """
+        rows = execute_query(query, (device_id, limit))
+    else:
+        query = """
+            SELECT id, device_client_id, alert_type, alert_message, alert_value, alert_index,
+                   status, current_level, notification_count, created_at, last_notified_at,
+                   escalated_level2_at, escalated_level3_at,
+                   ack_level1_at, ack_level1_by, ack_level2_at, ack_level2_by, ack_level3_at, ack_level3_by
+            FROM alert_escalation
+            WHERE status IN ('active', 'ack_level_1', 'ack_level_2', 'ack_level_3')
+            ORDER BY created_at DESC LIMIT %s
+        """
+        rows = execute_query(query, (limit,))
+    return {"alerts": convert_datetime(rows) if rows else []}
+
+
+# === BILLING ENDPOINTS ===
+
+# Pydantic models for billing
+
+# === HELPER: Auto-generate account movements ===
+
+def create_account_movement_auto(
+    company_id: int,
+    movement_type: str,
+    concept: str,
+    amount: float,
+    reference_type: str,
+    reference_id: int,
+    movement_date: str = None,
+    user_id: int = None
+):
+    """
+    Create an automatic account movement entry.
+    Used when invoices are emitted (DEBIT) or payments received (CREDIT).
+
+    Args:
+        company_id: Company ID
+        movement_type: 'debit' or 'credit'
+        concept: Description of the movement
+        amount: Amount in currency
+        reference_type: 'invoice', 'payment', 'credit_note', 'debit_note', 'adjustment'
+        reference_id: ID of the related document
+        movement_date: Date of movement (defaults to today)
+        user_id: User who created the movement
+    """
+    if movement_date is None:
+        movement_date = datetime.now().strftime('%Y-%m-%d')
+
+    debit_amount = amount if movement_type == 'debit' else 0
+    credit_amount = amount if movement_type == 'credit' else 0
+
+    execute_query("""
+        INSERT INTO account_movements
+        (company_id, movement_date, movement_type, concept,
+         reference_type, reference_id, debit_amount, credit_amount, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (company_id, movement_date, movement_type, concept,
+          reference_type, reference_id, debit_amount, credit_amount, user_id), "commit")
+
+    logging.info(f"[BILLING] Auto-movement: {movement_type} ${amount} for company {company_id} ({reference_type}:{reference_id})")
+
+
+def delete_account_movement_by_reference(reference_type: str, reference_id: int):
+    """Delete account movement by reference (used when deleting invoice/payment)."""
+    execute_query(
+        "DELETE FROM account_movements WHERE reference_type = %s AND reference_id = %s",
+        (reference_type, reference_id), "commit"
+    )
+    logging.info(f"[BILLING] Deleted movement for {reference_type}:{reference_id}")
+
+
+# Products
+class ProductCreate(BaseModel):
+    code: str
+    name: str
+    description: Optional[str] = None
+    unit: Optional[str] = "unidad"
+    unit_price: float
+    iva_rate: Optional[float] = 21.00
+    category: Optional[str] = "servicio"  # servicio, producto, instalacion, otro
+
+class ProductUpdate(BaseModel):
+    code: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    unit: Optional[str] = None
+    unit_price: Optional[float] = None
+    iva_rate: Optional[float] = None
+    category: Optional[str] = None
+    is_active: Optional[bool] = None
+
+# Contracts (recurring billing)
+class ContractCreate(BaseModel):
+    company_id: int
+    contract_number: str
+    plan_id: Optional[int] = None
+    custom_price_cents: Optional[int] = None
+    price_override: Optional[bool] = False
+    description: Optional[str] = None
+    start_date: str
+    end_date: Optional[str] = None
+    billing_cycle: Optional[str] = "mensual"  # mensual, bimestral, trimestral, semestral, anual
+    billing_day: Optional[int] = 1
+    status: Optional[str] = "activo"
+    notes: Optional[str] = None
+    items: Optional[List[dict]] = None  # [{product_id, quantity, unit_price, discount_percent}]
+
+class ContractUpdate(BaseModel):
+    plan_id: Optional[int] = None
+    custom_price_cents: Optional[int] = None
+    price_override: Optional[bool] = None
+    description: Optional[str] = None
+    end_date: Optional[str] = None
+    billing_cycle: Optional[str] = None
+    billing_day: Optional[int] = None
+    next_billing_date: Optional[str] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+class ContractItemCreate(BaseModel):
+    contract_id: int
+    product_id: int
+    description: Optional[str] = None
+    quantity: Optional[float] = 1
+    unit_price: float
+    discount_percent: Optional[float] = 0
+
+# Invoices (AFIP compatible)
+class InvoiceCreate(BaseModel):
+    company_id: int
+    invoice_type: Optional[str] = "X"  # A, B, C (AFIP) / X (internal) / P (quote)
+    point_of_sale: Optional[int] = 2
+    issue_date: str
+    due_date: str
+    period_from: Optional[str] = None
+    period_to: Optional[str] = None
+    contract_id: Optional[int] = None
+    status: Optional[str] = "borrador"
+    notes: Optional[str] = None
+    items: Optional[List[dict]] = None  # [{product_id, description, quantity, unit_price, iva_rate}]
+
+class InvoiceUpdate(BaseModel):
+    issue_date: Optional[str] = None
+    due_date: Optional[str] = None
+    period_from: Optional[str] = None
+    period_to: Optional[str] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+class InvoiceItemCreate(BaseModel):
+    invoice_id: int
+    product_id: Optional[int] = None
+    description: str
+    quantity: Optional[float] = 1
+    unit_price: float
+    iva_rate: Optional[float] = 21.00
+
+# Payments
+class PaymentCreate(BaseModel):
+    invoice_id: int
+    payment_date: str
+    amount: float
+    payment_method: str  # efectivo, transferencia, cheque, echeq, tarjeta, otro
+    reference: Optional[str] = None
+    check_id: Optional[int] = None
+    notes: Optional[str] = None
+
+class PaymentUpdate(BaseModel):
+    payment_date: Optional[str] = None
+    amount: Optional[float] = None
+    payment_method: Optional[str] = None
+    reference: Optional[str] = None
+    notes: Optional[str] = None
+
+# Checks Portfolio
+class CheckCreate(BaseModel):
+    check_type: str  # fisico, echeq
+    check_number: str
+    bank_name: Optional[str] = None
+    bank_code: Optional[str] = None
+    account_number: Optional[str] = None
+    amount: float
+    issue_date: str
+    deposit_date: str
+    issuer_name: Optional[str] = None
+    issuer_cuit: Optional[str] = None
+    company_id: Optional[int] = None
+    status: Optional[str] = "cartera"  # cartera, depositado, acreditado, rechazado, endosado
+    notes: Optional[str] = None
+
+class CheckUpdate(BaseModel):
+    # Status and lifecycle fields
+    status: Optional[str] = None
+    deposit_date: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    notes: Optional[str] = None
+    # Additional fields for error correction
+    check_number: Optional[str] = None
+    bank_name: Optional[str] = None
+    bank_code: Optional[str] = None
+    account_number: Optional[str] = None
+    amount: Optional[float] = None
+    issue_date: Optional[str] = None
+    issuer_name: Optional[str] = None
+    issuer_cuit: Optional[str] = None
+    company_id: Optional[int] = None
+
+
+# === PRODUCTS ENDPOINTS ===
+
+@router.get("/billing/products")
+async def list_products(user: dict = Depends(verify_token)):
+    """List all products/services."""
+    rows = execute_query("SELECT * FROM products ORDER BY category, name")
+    return {"products": convert_datetime(rows) if rows else []}
+
+@router.get("/billing/products/{id}")
+async def get_product(id: int, user: dict = Depends(verify_token)):
+    row = execute_query("SELECT * FROM products WHERE id = %s", (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    return convert_datetime(row)
+
+@router.post("/billing/products")
+async def create_product(product: ProductCreate, user: dict = Depends(verify_token)):
+    query = """INSERT INTO products (code, name, description, unit, unit_price, iva_rate, category)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (
+        product.code, product.name, product.description, product.unit,
+        product.unit_price, product.iva_rate, product.category
+    ), "commit")
+    logging.info(f"[ADMIN] Product created: {product.code}")
+    return {"success": True, "id": result["last_id"], "message": f"Producto '{product.name}' creado"}
+
+@router.put("/billing/products/{id}")
+async def update_product(id: int, product: ProductUpdate, user: dict = Depends(verify_token)):
+    updates, values = [], []
+    for field, value in product.dict(exclude_unset=True).items():
+        if value is not None:
+            updates.append(f"{field} = %s")
+            values.append(value)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+    values.append(id)
+    result = execute_query(f"UPDATE products SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    return {"success": True, "message": "Producto actualizado"}
+
+@router.delete("/billing/products/{id}")
+async def delete_product(id: int, user: dict = Depends(verify_token)):
+    # Soft delete - just deactivate
+    result = execute_query("UPDATE products SET is_active = 0 WHERE id = %s", (id,), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    return {"success": True, "message": "Producto desactivado"}
+
+
+# === CONTRACTS ENDPOINTS ===
+
+@router.get("/billing/contracts")
+async def list_contracts(company_id: Optional[int] = None, status: Optional[str] = None, user: dict = Depends(verify_token)):
+    """List contracts with optional filters."""
+    query = """SELECT c.*, co.name as company_name, sp.name as plan_name, sp.price as plan_price
+               FROM contracts c
+               JOIN company co ON c.company_id = co.id
+               LEFT JOIN service_plans sp ON c.plan_id = sp.id
+               WHERE 1=1"""
+    params = []
+    if company_id:
+        query += " AND c.company_id = %s"
+        params.append(company_id)
+    if status:
+        query += " AND c.status = %s"
+        params.append(status)
+    query += " ORDER BY c.created_at DESC"
+    rows = execute_query(query, tuple(params) if params else None)
+    return {"contracts": convert_datetime(rows) if rows else []}
+
+@router.get("/billing/contracts/{id}")
+async def get_contract(id: int, user: dict = Depends(verify_token)):
+    """Get contract with items."""
+    row = execute_query("""SELECT c.*, co.name as company_name, sp.name as plan_name, sp.price as plan_price
+                           FROM contracts c
+                           JOIN company co ON c.company_id = co.id
+                           LEFT JOIN service_plans sp ON c.plan_id = sp.id
+                           WHERE c.id = %s""", (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    # Get contract items
+    items = execute_query("""SELECT ci.*, p.code as product_code, p.name as product_name
+                             FROM contract_items ci
+                             JOIN products p ON ci.product_id = p.id
+                             WHERE ci.contract_id = %s""", (id,))
+    result = convert_datetime(row)
+    result["items"] = convert_datetime(items) if items else []
+    return result
+
+@router.post("/billing/contracts")
+async def create_contract(contract: ContractCreate, user: dict = Depends(verify_token)):
+    """Create contract with items."""
+    # Calculate next billing date based on start_date and billing_day
+    from datetime import datetime as dt
+    start = dt.strptime(contract.start_date, "%Y-%m-%d")
+    next_billing = start.replace(day=contract.billing_day or 1)
+    if next_billing < start:
+        # Move to next month
+        if next_billing.month == 12:
+            next_billing = next_billing.replace(year=next_billing.year + 1, month=1)
+        else:
+            next_billing = next_billing.replace(month=next_billing.month + 1)
+
+    query = """INSERT INTO contracts (company_id, contract_number, plan_id, custom_price_cents, price_override,
+               description, start_date, end_date, billing_cycle, billing_day, next_billing_date, status, notes)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (
+        contract.company_id, contract.contract_number, contract.plan_id,
+        contract.custom_price_cents, 1 if contract.price_override else 0,
+        contract.description, contract.start_date, contract.end_date, contract.billing_cycle,
+        contract.billing_day, next_billing.strftime("%Y-%m-%d"), contract.status, contract.notes
+    ), "commit")
+
+    contract_id = result["last_id"]
+
+    # Add items if provided
+    if contract.items:
+        for item in contract.items:
+            execute_query("""INSERT INTO contract_items (contract_id, product_id, description, quantity, unit_price, discount_percent)
+                            VALUES (%s, %s, %s, %s, %s, %s)""",
+                         (contract_id, item.get('product_id'), item.get('description'),
+                          item.get('quantity', 1), item.get('unit_price'), item.get('discount_percent', 0)), "commit")
+
+    logging.info(f"[ADMIN] Contract created: {contract.contract_number}")
+    return {"success": True, "id": contract_id, "message": f"Contrato '{contract.contract_number}' creado"}
+
+@router.put("/billing/contracts/{id}")
+async def update_contract(id: int, contract: ContractUpdate, user: dict = Depends(verify_token)):
+    updates, values = [], []
+    for field, value in contract.dict(exclude_unset=True).items():
+        if value is not None:
+            # Convert boolean to int for price_override (MySQL TINYINT)
+            if field == 'price_override':
+                value = 1 if value else 0
+            updates.append(f"{field} = %s")
+            values.append(value)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+    values.append(id)
+    result = execute_query(f"UPDATE contracts SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    return {"success": True, "message": "Contrato actualizado"}
+
+@router.delete("/billing/contracts/{id}")
+async def delete_contract(id: int, user: dict = Depends(verify_token)):
+    # Soft delete - just cancel
+    result = execute_query("UPDATE contracts SET status = 'cancelado' WHERE id = %s", (id,), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    return {"success": True, "message": "Contrato cancelado"}
+
+# Contract Items
+@router.post("/billing/contracts/{contract_id}/items")
+async def add_contract_item(contract_id: int, item: ContractItemCreate, user: dict = Depends(verify_token)):
+    query = """INSERT INTO contract_items (contract_id, product_id, description, quantity, unit_price, discount_percent)
+               VALUES (%s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (contract_id, item.product_id, item.description,
+                                   item.quantity, item.unit_price, item.discount_percent), "commit")
+    return {"success": True, "id": result["last_id"], "message": "Item agregado al contrato"}
+
+@router.delete("/billing/contracts/items/{item_id}")
+async def delete_contract_item(item_id: int, user: dict = Depends(verify_token)):
+    result = execute_query("DELETE FROM contract_items WHERE id = %s", (item_id,), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Item no encontrado")
+    return {"success": True, "message": "Item eliminado"}
+
+
+# === INVOICES ENDPOINTS ===
+
+def get_next_invoice_number(invoice_type: str, point_of_sale: int = 2):
+    """Get and increment the next invoice number for a type/POS."""
+    # Lock the row and get current value
+    row = execute_query(
+        "SELECT last_number FROM invoice_sequences WHERE invoice_type = %s AND point_of_sale = %s FOR UPDATE",
+        (invoice_type, point_of_sale), "one"
+    )
+    if not row:
+        # Create sequence if it doesn't exist
+        execute_query(
+            "INSERT INTO invoice_sequences (invoice_type, point_of_sale, last_number) VALUES (%s, %s, 0)",
+            (invoice_type, point_of_sale), "commit"
+        )
+        next_num = 1
+    else:
+        next_num = row['last_number'] + 1
+
+    # Update the sequence
+    execute_query(
+        "UPDATE invoice_sequences SET last_number = %s WHERE invoice_type = %s AND point_of_sale = %s",
+        (next_num, invoice_type, point_of_sale), "commit"
+    )
+
+    return next_num
+
+def get_next_receipt_number(point_of_sale: int = 2):
+    """Get and increment the next receipt number for payments (Recibo X)."""
+    # Lock the row and get current value - using invoice_type='R' for receipts
+    row = execute_query(
+        "SELECT last_number FROM invoice_sequences WHERE invoice_type = 'R' AND point_of_sale = %s FOR UPDATE",
+        (point_of_sale,), "one"
+    )
+    if not row:
+        # Create sequence if it doesn't exist
+        execute_query(
+            "INSERT INTO invoice_sequences (invoice_type, point_of_sale, last_number) VALUES ('R', %s, 0)",
+            (point_of_sale,), "commit"
+        )
+        next_num = 1
+    else:
+        next_num = row['last_number'] + 1
+
+    # Update the sequence
+    execute_query(
+        "UPDATE invoice_sequences SET last_number = %s WHERE invoice_type = 'R' AND point_of_sale = %s",
+        (next_num, point_of_sale), "commit"
+    )
+
+    return next_num
+
+@router.get("/billing/invoices")
+async def list_invoices(company_id: Optional[int] = None, status: Optional[str] = None,
+                        invoice_type: Optional[str] = None, limit: int = 100, user: dict = Depends(verify_token)):
+    """List invoices with optional filters."""
+    query = """SELECT i.*, co.name as company_name, co.tax_id as company_cuit
+               FROM invoices i
+               JOIN company co ON i.company_id = co.id
+               WHERE 1=1"""
+    params = []
+    if company_id:
+        query += " AND i.company_id = %s"
+        params.append(company_id)
+    if status:
+        query += " AND i.status = %s"
+        params.append(status)
+    if invoice_type:
+        query += " AND i.invoice_type = %s"
+        params.append(invoice_type)
+    query += " ORDER BY i.issue_date DESC, i.id DESC LIMIT %s"
+    params.append(limit)
+    rows = execute_query(query, tuple(params))
+    return {"invoices": convert_datetime(rows) if rows else []}
+
+@router.get("/billing/invoices/{id}")
+async def get_invoice(id: int, user: dict = Depends(verify_token)):
+    """Get invoice with items."""
+    row = execute_query("""SELECT i.*, co.name as company_name, co.tax_id as company_cuit,
+                                  co.condicion_iva, co.address as company_address
+                           FROM invoices i
+                           JOIN company co ON i.company_id = co.id
+                           WHERE i.id = %s""", (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+
+    # Get invoice items
+    items = execute_query("""SELECT ii.*, p.code as product_code, p.name as product_name
+                             FROM invoice_items ii
+                             LEFT JOIN products p ON ii.product_id = p.id
+                             WHERE ii.invoice_id = %s""", (id,))
+
+    # Get payments
+    payments = execute_query("SELECT * FROM payments WHERE invoice_id = %s ORDER BY payment_date", (id,))
+
+    result = convert_datetime(row)
+    result["items"] = convert_datetime(items) if items else []
+    result["payments"] = convert_datetime(payments) if payments else []
+    return result
+
+@router.post("/billing/invoices")
+async def create_invoice(invoice: InvoiceCreate, user: dict = Depends(verify_token)):
+    """Create invoice with items. Auto-generates invoice number."""
+    # Get next invoice number
+    invoice_number = get_next_invoice_number(invoice.invoice_type, invoice.point_of_sale)
+
+    # Calculate totals from items
+    subtotal = 0
+    tax = 0
+    if invoice.items:
+        for item in invoice.items:
+            item_subtotal = item.get('quantity', 1) * item.get('unit_price', 0)
+            # Validate iva_rate is within valid range (0-100%)
+            iva_rate = item.get('iva_rate', 21)
+            if iva_rate is None or iva_rate < 0 or iva_rate > 100:
+                iva_rate = 21.0
+            item_iva = item_subtotal * (iva_rate / 100)
+            subtotal += item_subtotal
+            tax += item_iva
+    total = subtotal + tax
+
+    query = """INSERT INTO invoices (company_id, invoice_type, point_of_sale, invoice_number,
+               issue_date, due_date, period_from, period_to, contract_id,
+               subtotal, tax, total, status, notes, created_by)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (
+        invoice.company_id, invoice.invoice_type, invoice.point_of_sale, invoice_number,
+        invoice.issue_date, invoice.due_date, invoice.period_from, invoice.period_to,
+        invoice.contract_id, subtotal, tax, total, invoice.status, invoice.notes, None
+    ), "commit")
+
+    invoice_id = result["last_id"]
+
+    # Add items
+    if invoice.items:
+        for item in invoice.items:
+            item_subtotal = item.get('quantity', 1) * item.get('unit_price', 0)
+            # Validate iva_rate is within valid range (0-100%)
+            item_iva_rate = item.get('iva_rate', 21)
+            if item_iva_rate is None or item_iva_rate < 0 or item_iva_rate > 100:
+                item_iva_rate = 21.0  # Default to 21% IVA
+            item_iva = item_subtotal * (item_iva_rate / 100)
+            item_total = item_subtotal + item_iva
+
+            execute_query("""INSERT INTO invoice_items (invoice_id, product_id, description, quantity,
+                            unit_price, iva_rate, iva_amount, subtotal, total)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                         (invoice_id, item.get('product_id'), item.get('description'),
+                          item.get('quantity', 1), item.get('unit_price'), item_iva_rate,
+                          item_iva, item_subtotal, item_total), "commit")
+
+    # Format invoice number for display (e.g., "00002-00000001")
+    formatted_number = f"{invoice.point_of_sale:05d}-{invoice_number:08d}"
+
+    # Auto-create DEBIT movement in cuenta corriente if invoice is not a draft
+    if invoice.status != 'borrador' and total > 0:
+        create_account_movement_auto(
+            company_id=invoice.company_id,
+            movement_type='debit',
+            concept=f"Factura {invoice.invoice_type} {formatted_number}",
+            amount=total,
+            reference_type='invoice',
+            reference_id=invoice_id,
+            movement_date=invoice.issue_date,
+            user_id=user.get('user_id')
+        )
+
+    logging.info(f"[ADMIN] Invoice created: {invoice.invoice_type} {formatted_number}")
+    return {"success": True, "id": invoice_id, "invoice_number": invoice_number,
+            "formatted_number": formatted_number, "message": f"Comprobante {invoice.invoice_type} {formatted_number} creado"}
+
+@router.put("/billing/invoices/{id}")
+async def update_invoice(id: int, invoice: InvoiceUpdate, user: dict = Depends(verify_token)):
+    # Check if invoice can be modified (only drafts)
+    current = execute_query("SELECT status, cae FROM invoices WHERE id = %s", (id,), "one")
+    if not current:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+    if current.get('cae'):
+        raise HTTPException(status_code=400, detail="No se puede modificar una factura con CAE")
+
+    updates, values = [], []
+    for field, value in invoice.dict(exclude_unset=True).items():
+        if value is not None:
+            updates.append(f"{field} = %s")
+            values.append(value)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+    values.append(id)
+    execute_query(f"UPDATE invoices SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+    return {"success": True, "message": "Factura actualizada"}
+
+@router.delete("/billing/invoices/{id}")
+async def delete_invoice(id: int, user: dict = Depends(verify_token)):
+    # Check if invoice can be deleted (only drafts without CAE)
+    current = execute_query("SELECT status, cae FROM invoices WHERE id = %s", (id,), "one")
+    if not current:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+    if current.get('cae'):
+        raise HTTPException(status_code=400, detail="No se puede eliminar una factura con CAE. Use anulación.")
+
+    # Delete associated account movement
+    delete_account_movement_by_reference('invoice', id)
+
+    # Delete items first, then invoice
+    execute_query("DELETE FROM invoice_items WHERE invoice_id = %s", (id,), "commit")
+    execute_query("DELETE FROM invoices WHERE id = %s", (id,), "commit")
+    return {"success": True, "message": "Factura eliminada"}
+
+# Invoice Items
+@router.post("/billing/invoices/{invoice_id}/items")
+async def add_invoice_item(invoice_id: int, item: InvoiceItemCreate, user: dict = Depends(verify_token)):
+    # Check invoice exists and is draft
+    current = execute_query("SELECT status, cae FROM invoices WHERE id = %s", (invoice_id,), "one")
+    if not current:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+    if current.get('cae'):
+        raise HTTPException(status_code=400, detail="No se puede modificar una factura con CAE")
+
+    item_subtotal = item.quantity * item.unit_price
+    item_iva = item_subtotal * (item.iva_rate / 100)
+    item_total = item_subtotal + item_iva
+
+    query = """INSERT INTO invoice_items (invoice_id, product_id, description, quantity,
+               unit_price, iva_rate, iva_amount, subtotal, total)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (invoice_id, item.product_id, item.description,
+                                   item.quantity, item.unit_price, item.iva_rate,
+                                   item_iva, item_subtotal, item_total), "commit")
+
+    # Recalculate invoice totals
+    _recalculate_invoice_totals(invoice_id)
+
+    return {"success": True, "id": result["last_id"], "message": "Item agregado"}
+
+@router.delete("/billing/invoices/items/{item_id}")
+async def delete_invoice_item(item_id: int, user: dict = Depends(verify_token)):
+    # Get invoice_id first
+    item = execute_query("SELECT invoice_id FROM invoice_items WHERE id = %s", (item_id,), "one")
+    if not item:
+        raise HTTPException(status_code=404, detail="Item no encontrado")
+
+    invoice_id = item['invoice_id']
+
+    # Check invoice can be modified
+    current = execute_query("SELECT cae FROM invoices WHERE id = %s", (invoice_id,), "one")
+    if current and current.get('cae'):
+        raise HTTPException(status_code=400, detail="No se puede modificar una factura con CAE")
+
+    execute_query("DELETE FROM invoice_items WHERE id = %s", (item_id,), "commit")
+
+    # Recalculate invoice totals
+    _recalculate_invoice_totals(invoice_id)
+
+    return {"success": True, "message": "Item eliminado"}
+
+def _recalculate_invoice_totals(invoice_id: int):
+    """Recalculate subtotal, tax, and total for an invoice."""
+    items = execute_query("SELECT subtotal, iva_amount FROM invoice_items WHERE invoice_id = %s", (invoice_id,))
+    subtotal = sum(i.get('subtotal', 0) or 0 for i in (items or []))
+    tax = sum(i.get('iva_amount', 0) or 0 for i in (items or []))
+    total = subtotal + tax
+    execute_query("UPDATE invoices SET subtotal = %s, tax = %s, total = %s WHERE id = %s",
+                 (subtotal, tax, total, invoice_id), "commit")
+
+
+@router.post("/billing/invoices/{invoice_id}/emit")
+async def emit_invoice(invoice_id: int, user: dict = Depends(verify_token)):
+    """Emit an invoice: change status from 'borrador' to 'emitida' and create account movement."""
+    # Get invoice
+    invoice = execute_query("SELECT * FROM invoices WHERE id = %s", (invoice_id,), "one")
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+
+    if invoice['status'] != 'borrador':
+        raise HTTPException(status_code=400, detail="Solo se pueden emitir facturas en estado borrador")
+
+    if not invoice.get('total') or invoice['total'] <= 0:
+        raise HTTPException(status_code=400, detail="La factura debe tener un monto mayor a 0")
+
+    # Update status to 'emitida'
+    execute_query("UPDATE invoices SET status = 'emitida' WHERE id = %s", (invoice_id,), "commit")
+
+    # Create debit movement in account_movements
+    type_names = {'A': 'Factura A', 'B': 'Factura B', 'C': 'Factura C', 'X': 'Factura X', 'P': 'Presupuesto'}
+    invoice_label = type_names.get(invoice['invoice_type'], f"Factura {invoice['invoice_type']}")
+    point_of_sale = str(invoice.get('point_of_sale', 2)).zfill(5)
+    invoice_number = str(invoice.get('invoice_number', 0)).zfill(8)
+
+    create_account_movement_auto(
+        company_id=invoice['company_id'],
+        movement_type='debit',
+        concept=f"{invoice_label} {point_of_sale}-{invoice_number}",
+        amount=invoice['total'],
+        reference_type='invoice',
+        reference_id=invoice_id,
+        movement_date=str(invoice.get('issue_date')) if invoice.get('issue_date') else None
+    )
+
+    return {"success": True, "message": "Factura emitida correctamente"}
+
+
+# === PAYMENTS ENDPOINTS ===
+
+@router.get("/billing/payments")
+async def list_payments(invoice_id: Optional[int] = None, limit: int = 100, user: dict = Depends(verify_token)):
+    """List payments with optional filters."""
+    query = """SELECT p.*, i.invoice_number, i.invoice_type, i.point_of_sale,
+                      co.name as company_name
+               FROM payments p
+               JOIN invoices i ON p.invoice_id = i.id
+               JOIN company co ON i.company_id = co.id
+               WHERE 1=1"""
+    params = []
+    if invoice_id:
+        query += " AND p.invoice_id = %s"
+        params.append(invoice_id)
+    query += " ORDER BY p.payment_date DESC LIMIT %s"
+    params.append(limit)
+    rows = execute_query(query, tuple(params))
+    return {"payments": convert_datetime(rows) if rows else []}
+
+@router.get("/billing/payments/{id}")
+async def get_payment(id: int, user: dict = Depends(verify_token)):
+    row = execute_query("""SELECT p.*, i.invoice_number, i.invoice_type, i.point_of_sale,
+                                  co.name as company_name
+                           FROM payments p
+                           JOIN invoices i ON p.invoice_id = i.id
+                           JOIN company co ON i.company_id = co.id
+                           WHERE p.id = %s""", (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Pago no encontrado")
+    return convert_datetime(row)
+
+@router.post("/billing/payments")
+async def create_payment(payment: PaymentCreate, user: dict = Depends(verify_token)):
+    # Get invoice info for cuenta corriente movement
+    inv = execute_query(
+        "SELECT company_id, invoice_type, point_of_sale, invoice_number, total FROM invoices WHERE id = %s",
+        (payment.invoice_id,), "one"
+    )
+    if not inv:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+
+    # Generate receipt number (Recibo X 00002-00000001)
+    point_of_sale = 2  # Default POS for receipts
+    receipt_number = get_next_receipt_number(point_of_sale)
+    formatted_receipt = f"{point_of_sale:05d}-{receipt_number:08d}"
+
+    query = """INSERT INTO payments (invoice_id, company_id, receipt_number, receipt_point_of_sale,
+               payment_date, amount, payment_method, reference, check_id, notes)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (
+        payment.invoice_id, inv['company_id'], receipt_number, point_of_sale,
+        payment.payment_date, payment.amount,
+        payment.payment_method, payment.reference, payment.check_id, payment.notes
+    ), "commit")
+
+    payment_id = result["last_id"]
+
+    # Auto-create CREDIT movement in cuenta corriente with Recibo number
+    inv_formatted = f"{inv['point_of_sale']:05d}-{inv['invoice_number']:08d}"
+    create_account_movement_auto(
+        company_id=inv['company_id'],
+        movement_type='credit',
+        concept=f"Recibo X {formatted_receipt} - Pago Factura {inv['invoice_type']} {inv_formatted}",
+        amount=payment.amount,
+        reference_type='payment',
+        reference_id=payment_id,
+        movement_date=payment.payment_date,
+        user_id=user.get('user_id')
+    )
+
+    # Update invoice status based on total payments
+    paid = execute_query(
+        "SELECT COALESCE(SUM(amount), 0) as paid FROM payments WHERE invoice_id = %s",
+        (payment.invoice_id,), "one"
+    )
+    total_paid = paid.get('paid', 0) if paid else 0
+    invoice_total = inv.get('total', 0) or 0
+
+    if total_paid >= invoice_total:
+        execute_query("UPDATE invoices SET status = 'pagada' WHERE id = %s", (payment.invoice_id,), "commit")
+    elif total_paid > 0:
+        execute_query("UPDATE invoices SET status = 'parcial' WHERE id = %s", (payment.invoice_id,), "commit")
+
+    logging.info(f"[ADMIN] Payment created - Recibo X {formatted_receipt} for invoice {payment.invoice_id}: ${payment.amount}")
+    return {"success": True, "id": payment_id, "receipt_number": formatted_receipt, "message": f"Recibo X {formatted_receipt} registrado"}
+
+@router.put("/billing/payments/{id}")
+async def update_payment(id: int, payment: PaymentUpdate, user: dict = Depends(verify_token)):
+    updates, values = [], []
+    for field, value in payment.dict(exclude_unset=True).items():
+        if value is not None:
+            updates.append(f"{field} = %s")
+            values.append(value)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+    values.append(id)
+    result = execute_query(f"UPDATE payments SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Pago no encontrado")
+    return {"success": True, "message": "Pago actualizado"}
+
+@router.delete("/billing/payments/{id}")
+async def delete_payment(id: int, user: dict = Depends(verify_token)):
+    # Get invoice_id before deleting
+    payment = execute_query("SELECT invoice_id FROM payments WHERE id = %s", (id,), "one")
+    if not payment:
+        raise HTTPException(status_code=404, detail="Pago no encontrado")
+
+    invoice_id = payment['invoice_id']
+
+    # Delete associated account movement
+    delete_account_movement_by_reference('payment', id)
+
+    execute_query("DELETE FROM payments WHERE id = %s", (id,), "commit")
+
+    # Recalculate invoice status
+    inv = execute_query("SELECT total, status FROM invoices WHERE id = %s", (invoice_id,), "one")
+    if inv and inv.get('status') != 'anulada':
+        paid = execute_query(
+            "SELECT COALESCE(SUM(amount), 0) as paid FROM payments WHERE invoice_id = %s",
+            (invoice_id,), "one"
+        )
+        total_paid = paid.get('paid', 0) if paid else 0
+        invoice_total = inv.get('total', 0) or 0
+
+        if total_paid >= invoice_total:
+            new_status = 'pagada'
+        elif total_paid > 0:
+            new_status = 'parcial'
+        else:
+            new_status = 'emitida'
+        execute_query("UPDATE invoices SET status = %s WHERE id = %s", (new_status, invoice_id), "commit")
+
+    return {"success": True, "message": "Pago eliminado"}
+
+
+# === ACCOUNT MOVEMENTS (CUENTA CORRIENTE) ENDPOINTS ===
+
+class MovementCreate(BaseModel):
+    company_id: int
+    movement_date: str
+    movement_type: str  # debit, credit
+    concept: str
+    reference_type: Optional[str] = None  # invoice, payment, debit_note, credit_note, adjustment, initial_balance
+    reference_id: Optional[int] = None
+    debit_amount: Optional[float] = 0.0
+    credit_amount: Optional[float] = 0.0
+    payment_method: Optional[str] = None
+    reference_number: Optional[str] = None
+    notes: Optional[str] = None
+
+class MovementUpdate(BaseModel):
+    movement_date: Optional[str] = None
+    concept: Optional[str] = None
+    debit_amount: Optional[float] = None
+    credit_amount: Optional[float] = None
+    payment_method: Optional[str] = None
+    reference_number: Optional[str] = None
+    notes: Optional[str] = None
+
+@router.get("/billing/account-movements")
+async def list_account_movements(company_id: Optional[int] = None, limit: int = 100, user: dict = Depends(verify_token)):
+    """List account movements with running balance."""
+    if company_id:
+        query = """SELECT * FROM v_account_statement WHERE company_id = %s ORDER BY movement_date DESC, id DESC LIMIT %s"""
+        rows = execute_query(query, (company_id, limit))
+    else:
+        query = """SELECT * FROM v_account_statement ORDER BY movement_date DESC, id DESC LIMIT %s"""
+        rows = execute_query(query, (limit,))
+    return {"movements": convert_datetime(rows) if rows else []}
+
+@router.get("/billing/account-movements/{id}")
+async def get_account_movement(id: int, user: dict = Depends(verify_token)):
+    row = execute_query("""SELECT * FROM v_account_statement WHERE id = %s""", (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Movimiento no encontrado")
+    return convert_datetime(row)
+
+@router.get("/billing/company-balances")
+async def get_company_balances(user: dict = Depends(verify_token)):
+    """Get balance summary for all companies."""
+    rows = execute_query("SELECT * FROM v_company_balance ORDER BY company_name")
+    return {"balances": convert_datetime(rows) if rows else []}
+
+@router.get("/billing/company-balance/{company_id}")
+async def get_company_balance(company_id: int, user: dict = Depends(verify_token)):
+    """Get balance for a specific company."""
+    row = execute_query("SELECT * FROM v_company_balance WHERE company_id = %s", (company_id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Empresa no encontrada")
+    return convert_datetime(row)
+
+@router.post("/billing/account-movements")
+async def create_account_movement(mov: MovementCreate, user: dict = Depends(verify_token)):
+    """Create a new account movement (debit or credit)."""
+    # Validate movement type
+    if mov.movement_type not in ('debit', 'credit'):
+        raise HTTPException(status_code=400, detail="movement_type debe ser 'debit' o 'credit'")
+
+    # Set amounts based on type
+    debit_amount = mov.debit_amount if mov.movement_type == 'debit' else 0
+    credit_amount = mov.credit_amount if mov.movement_type == 'credit' else 0
+
+    # If only one amount provided, use it for the correct field
+    if mov.movement_type == 'debit' and debit_amount == 0 and mov.credit_amount > 0:
+        debit_amount = mov.credit_amount
+        credit_amount = 0
+    elif mov.movement_type == 'credit' and credit_amount == 0 and mov.debit_amount > 0:
+        credit_amount = mov.debit_amount
+        debit_amount = 0
+
+    # Generate Recibo X for credit movements (payments/pagos a cuenta)
+    receipt_number = None
+    formatted_receipt = None
+    if mov.movement_type == 'credit':
+        point_of_sale = 2
+        receipt_number = get_next_receipt_number(point_of_sale)
+        formatted_receipt = f"{point_of_sale:05d}-{receipt_number:08d}"
+        # Prepend receipt number to concept if not already there
+        if not mov.concept.startswith('Recibo X'):
+            mov.concept = f"Recibo X {formatted_receipt} - {mov.concept}"
+
+    query = """INSERT INTO account_movements
+               (company_id, movement_date, movement_type, concept, reference_type, reference_id,
+                debit_amount, credit_amount, payment_method, reference_number, notes, created_by)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+
+    result = execute_query(query, (
+        mov.company_id, mov.movement_date, mov.movement_type, mov.concept,
+        mov.reference_type, mov.reference_id, debit_amount, credit_amount,
+        mov.payment_method, formatted_receipt or mov.reference_number, mov.notes, user.get('user_id')
+    ), "commit")
+
+    logging.info(f"[ADMIN] Account movement created for company {mov.company_id}: {mov.movement_type} ${debit_amount if mov.movement_type == 'debit' else credit_amount}")
+
+    response = {"success": True, "id": result["last_id"], "message": "Movimiento registrado"}
+    if formatted_receipt:
+        response["receipt_number"] = formatted_receipt
+        response["message"] = f"Recibo X {formatted_receipt} registrado"
+    return response
+
+@router.put("/billing/account-movements/{id}")
+async def update_account_movement(id: int, mov: MovementUpdate, user: dict = Depends(verify_token)):
+    updates, values = [], []
+    for field, value in mov.dict(exclude_unset=True).items():
+        if value is not None:
+            updates.append(f"{field} = %s")
+            values.append(value)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+    values.append(id)
+    result = execute_query(f"UPDATE account_movements SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Movimiento no encontrado")
+    return {"success": True, "message": "Movimiento actualizado"}
+
+@router.delete("/billing/account-movements/{id}")
+async def delete_account_movement(id: int, user: dict = Depends(verify_token)):
+    mov = execute_query("SELECT id FROM account_movements WHERE id = %s", (id,), "one")
+    if not mov:
+        raise HTTPException(status_code=404, detail="Movimiento no encontrado")
+    execute_query("DELETE FROM account_movements WHERE id = %s", (id,), "commit")
+    return {"success": True, "message": "Movimiento eliminado"}
+
+
+# === CHECKS PORTFOLIO ENDPOINTS ===
+
+@router.get("/billing/checks")
+async def list_checks(status: Optional[str] = None, company_id: Optional[int] = None,
+                      limit: int = 100, user: dict = Depends(verify_token)):
+    """List checks in portfolio."""
+    query = """SELECT c.*, co.name as company_name
+               FROM checks_portfolio c
+               LEFT JOIN company co ON c.company_id = co.id
+               WHERE 1=1"""
+    params = []
+    if status:
+        query += " AND c.status = %s"
+        params.append(status)
+    if company_id:
+        query += " AND c.company_id = %s"
+        params.append(company_id)
+    query += " ORDER BY c.deposit_date ASC LIMIT %s"
+    params.append(limit)
+    rows = execute_query(query, tuple(params))
+    return {"checks": convert_datetime(rows) if rows else []}
+
+@router.get("/billing/checks/{id}")
+async def get_check(id: int, user: dict = Depends(verify_token)):
+    row = execute_query("""SELECT c.*, co.name as company_name
+                           FROM checks_portfolio c
+                           LEFT JOIN company co ON c.company_id = co.id
+                           WHERE c.id = %s""", (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Cheque no encontrado")
+    return convert_datetime(row)
+
+@router.post("/billing/checks")
+async def create_check(check: CheckCreate, user: dict = Depends(verify_token)):
+    query = """INSERT INTO checks_portfolio (check_type, check_number, bank_name, bank_code,
+               account_number, amount, issue_date, deposit_date, issuer_name, issuer_cuit,
+               company_id, status, notes)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+    result = execute_query(query, (
+        check.check_type, check.check_number, check.bank_name, check.bank_code,
+        check.account_number, check.amount, check.issue_date, check.deposit_date,
+        check.issuer_name, check.issuer_cuit, check.company_id, check.status, check.notes
+    ), "commit")
+    logging.info(f"[ADMIN] Check created: {check.check_number}")
+    return {"success": True, "id": result["last_id"], "message": "Cheque registrado"}
+
+@router.put("/billing/checks/{id}")
+async def update_check(id: int, check: CheckUpdate, user: dict = Depends(verify_token)):
+    updates, values = [], []
+    for field, value in check.dict(exclude_unset=True).items():
+        if value is not None:
+            updates.append(f"{field} = %s")
+            values.append(value)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+    values.append(id)
+    result = execute_query(f"UPDATE checks_portfolio SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Cheque no encontrado")
+    return {"success": True, "message": "Cheque actualizado"}
+
+@router.delete("/billing/checks/{id}")
+async def delete_check(id: int, user: dict = Depends(verify_token)):
+    result = execute_query("DELETE FROM checks_portfolio WHERE id = %s", (id,), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Cheque no encontrado")
+    return {"success": True, "message": "Cheque eliminado"}
+
+
+# === BILLING SUMMARY/REPORTS ===
+
+@router.get("/billing/company/{company_id}")
+async def get_company_billing(company_id: int, user: dict = Depends(verify_token)):
+    """Get billing summary for a company: contracts, invoices, payments, balance.
+
+    Balance is now calculated from account_movements (unified cuenta corriente).
+    """
+    # Get active contracts with plan info
+    contracts = execute_query("""SELECT c.*, sp.name as plan_name, sp.price as plan_price
+                                 FROM contracts c
+                                 LEFT JOIN service_plans sp ON c.plan_id = sp.id
+                                 WHERE c.company_id = %s AND c.status = 'activo'
+                                 ORDER BY c.next_billing_date""", (company_id,))
+
+    # Build subscription info from first active contract (for frontend compatibility)
+    subscription = None
+    if contracts:
+        c = contracts[0]
+        subscription = {
+            "plan_name": c.get('plan_name') or c.get('description') or 'Plan activo',
+            "status": c.get('status', 'activo'),
+            "next_billing_date": c.get('next_billing_date')
+        }
+
+    # Get invoices
+    invoices = execute_query("""SELECT * FROM invoices
+                                WHERE company_id = %s
+                                ORDER BY issue_date DESC LIMIT 50""", (company_id,))
+
+    # Get ALL payments for this company (from account_movements for completeness)
+    # This includes payments linked to invoices AND standalone payments (pagos a cuenta)
+    payments = execute_query("""
+        SELECT
+            am.id,
+            am.movement_date as payment_date,
+            am.credit_amount as amount,
+            am.payment_method,
+            am.concept as reference,
+            CASE
+                WHEN am.reference_type = 'payment' THEN 'confirmed'
+                ELSE 'confirmed'
+            END as status,
+            am.reference_type,
+            am.reference_id
+        FROM account_movements am
+        WHERE am.company_id = %s AND am.movement_type = 'credit'
+        ORDER BY am.movement_date DESC
+        LIMIT 50
+    """, (company_id,))
+
+    # Get balance from unified cuenta corriente (v_company_balance view)
+    balance_row = execute_query(
+        "SELECT * FROM v_company_balance WHERE company_id = %s",
+        (company_id,), "one"
+    )
+
+    # Extract values, defaulting to 0 if no movements yet
+    total_debit = balance_row.get('total_debit', 0) if balance_row else 0
+    total_credit = balance_row.get('total_credit', 0) if balance_row else 0
+    balance = balance_row.get('balance', 0) if balance_row else 0
+
+    return {
+        "contracts": convert_datetime(contracts) if contracts else [],
+        "subscription": subscription,  # For frontend compatibility
+        "invoices": convert_datetime(invoices) if invoices else [],
+        "payments": convert_datetime(payments) if payments else [],
+        "total_debit": total_debit,      # Total facturado (débitos)
+        "total_credit": total_credit,    # Total pagado (créditos)
+        "balance": balance               # Saldo pendiente (debit - credit)
+    }
+
+@router.get("/billing/summary")
+async def get_billing_summary(user: dict = Depends(verify_token)):
+    """Get overall billing summary for dashboard with cuenta corriente data."""
+    from datetime import date
+    today = date.today()
+
+    # Invoices by status
+    invoice_stats = execute_query("""SELECT status, COUNT(*) as count, SUM(total) as total
+                                     FROM invoices GROUP BY status""")
+
+    # Pending balance by company - use v_company_balance view (source of truth)
+    pending = execute_query("""SELECT company_id as id, company_name as name,
+                                      total_debit as invoiced, total_credit as paid, balance
+                               FROM v_company_balance
+                               WHERE balance > 0
+                               ORDER BY balance DESC
+                               LIMIT 15""")
+
+    # Checks to deposit this month
+    month_end = today.replace(day=28) if today.month == 2 else today.replace(day=30)
+    checks_pending = execute_query("""SELECT * FROM checks_portfolio
+                                      WHERE status = 'cartera' AND deposit_date <= %s
+                                      ORDER BY deposit_date""", (month_end.strftime("%Y-%m-%d"),))
+
+    # Contracts due for billing
+    contracts_due = execute_query("""SELECT c.*, co.name as company_name
+                                     FROM contracts c
+                                     JOIN company co ON c.company_id = co.id
+                                     WHERE c.status = 'activo' AND c.next_billing_date <= %s
+                                     ORDER BY c.next_billing_date""", (today.strftime("%Y-%m-%d"),))
+
+    # Recent account movements (last 20)
+    recent_movements = execute_query("""
+        SELECT am.id, am.movement_date, am.movement_type, am.concept,
+               am.debit_amount, am.credit_amount, am.payment_method,
+               am.reference_type, am.reference_id,
+               c.name as company_name, c.id as company_id
+        FROM account_movements am
+        JOIN company c ON am.company_id = c.id
+        ORDER BY am.movement_date DESC, am.id DESC
+        LIMIT 20
+    """)
+
+    # Global totals from account_movements
+    totals = execute_query("""
+        SELECT
+            COALESCE(SUM(debit_amount), 0) as total_debit,
+            COALESCE(SUM(credit_amount), 0) as total_credit
+        FROM account_movements
+    """, fetch="one")
+
+    return {
+        "invoice_stats": invoice_stats or [],
+        "pending_balances": pending or [],
+        "checks_to_deposit": convert_datetime(checks_pending) if checks_pending else [],
+        "contracts_due": convert_datetime(contracts_due) if contracts_due else [],
+        "recent_movements": convert_datetime(recent_movements) if recent_movements else [],
+        "global_totals": {
+            "total_debit": float(totals.get('total_debit', 0)) if totals else 0,
+            "total_credit": float(totals.get('total_credit', 0)) if totals else 0,
+            "balance": float(totals.get('total_debit', 0) - totals.get('total_credit', 0)) if totals else 0
+        }
+    }
+
+@router.get("/billing/plans")
+async def list_plans(user: dict = Depends(verify_token)):
+    """List all service plans."""
+    rows = execute_query("SELECT * FROM service_plans ORDER BY price")
+    return {"plans": convert_datetime(rows) if rows else []}
+
+
+# === ADMIN USERS ENDPOINTS ===
+
+@router.get("/users")
+async def list_admin_users(user: dict = Depends(verify_token)):
+    """List all admin users (superadmin only)."""
+    query = """SELECT au.id, au.username, au.email, au.full_name, au.role, au.is_active,
+                      au.last_login, au.created_at, au.company_id, c.name as company_name
+               FROM admin_users au
+               LEFT JOIN company c ON au.company_id = c.id
+               ORDER BY au.username"""
+    rows = execute_query(query)
+    return {"users": convert_datetime(rows) if rows else []}
+
+
+@router.get("/users/{id}")
+async def get_admin_user(id: int, user: dict = Depends(verify_token)):
+    """Get admin user details."""
+    query = """SELECT au.id, au.username, au.email, au.full_name, au.role, au.is_active,
+                      au.last_login, au.login_attempts, au.locked_until, au.created_at,
+                      au.updated_at, au.company_id, c.name as company_name
+               FROM admin_users au
+               LEFT JOIN company c ON au.company_id = c.id
+               WHERE au.id = %s"""
+    row = execute_query(query, (id,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return convert_datetime(row)
+
+
+@router.post("/users")
+async def create_admin_user(admin_user: AdminUserCreate, user: dict = Depends(verify_token)):
+    """Create a new admin user with default password (superadmin only).
+    New users always get the default password and must change it on first login."""
+    # Validate empresa role requires company_id
+    if admin_user.role == 'empresa' and not admin_user.company_id:
+        raise HTTPException(status_code=400, detail="El rol 'empresa' requiere seleccionar una empresa")
+
+    # Always use dynamic default password from DB for new users - they MUST change it
+    default_hash = get_default_password_hash()
+
+    query = """INSERT INTO admin_users (username, password_hash, email, full_name, role, company_id, must_change_password)
+               VALUES (%s, %s, %s, %s, %s, %s, TRUE)"""
+    try:
+        result = execute_query(query, (
+            admin_user.username, default_hash, admin_user.email,
+            admin_user.full_name, admin_user.role, admin_user.company_id
+        ), "commit")
+        logging.info(f"[ADMIN] User created: {admin_user.username} (role={admin_user.role}, company_id={admin_user.company_id})")
+        return {"success": True, "id": result["last_id"], "message": f"Usuario '{admin_user.username}' creado con clave por defecto"}
+    except Exception as e:
+        if "Duplicate entry" in str(e):
+            raise HTTPException(status_code=400, detail="El nombre de usuario ya existe")
+        raise
+
+
+@router.put("/users/{id}")
+async def update_admin_user(id: int, admin_user: AdminUserUpdate, user: dict = Depends(verify_token)):
+    """Update admin user details. Only superadmin can modify another superadmin."""
+    # Check superadmin protection
+    check_superadmin_protection(id, user.get("sub"))
+
+    # Validate empresa role requires company_id
+    if admin_user.role == 'empresa' and admin_user.company_id is None:
+        # Check if user already has a company_id
+        existing = execute_query("SELECT company_id FROM admin_users WHERE id = %s", (id,), "one")
+        if not existing or not existing.get('company_id'):
+            raise HTTPException(status_code=400, detail="El rol 'empresa' requiere seleccionar una empresa")
+
+    updates, values = [], []
+    for field, value in admin_user.dict(exclude_unset=True).items():
+        if value is not None or field == 'company_id':  # Allow setting company_id to NULL
+            updates.append(f"{field} = %s")
+            values.append(value)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+    values.append(id)
+    result = execute_query(f"UPDATE admin_users SET {', '.join(updates)} WHERE id = %s", tuple(values), "commit")
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    logging.info(f"[ADMIN] User updated: id={id}")
+    return {"success": True, "message": "Usuario actualizado"}
+
+
+@router.put("/users/{id}/password")
+async def change_admin_password(id: int, pwd: AdminPasswordChange, user: dict = Depends(verify_token)):
+    """Change admin user password. Also clears must_change_password flag.
+    Only superadmin can change another superadmin's password."""
+    # Check superadmin protection
+    check_superadmin_protection(id, user.get("sub"))
+
+    password_hash = hashlib.sha256(pwd.new_password.encode()).hexdigest()
+    result = execute_query(
+        """UPDATE admin_users SET password_hash = %s, must_change_password = FALSE,
+           login_attempts = 0, locked_until = NULL WHERE id = %s""",
+        (password_hash, id), "commit"
+    )
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    logging.info(f"[ADMIN] Password changed: id={id} (must_change_password cleared)")
+    return {"success": True, "message": "Contraseña actualizada"}
+
+
+@router.delete("/users/{id}")
+async def delete_admin_user(id: int, user: dict = Depends(verify_token)):
+    """Delete admin user (cannot delete self or last superadmin).
+    Only superadmin can delete another superadmin."""
+    # Check superadmin protection first
+    target = check_superadmin_protection(id, user.get("sub"))
+
+    if target["username"] == user.get("sub"):
+        raise HTTPException(status_code=400, detail="No puede eliminarse a sí mismo")
+
+    # Check if it's the last superadmin
+    if target.get("role") == "superadmin":
+        superadmins = execute_query(
+            "SELECT COUNT(*) as cnt FROM admin_users WHERE role = 'superadmin' AND is_active = TRUE",
+            fetch="one"
+        )
+        if superadmins.get("cnt", 0) <= 1:
+            raise HTTPException(status_code=400, detail="No se puede eliminar el último superadmin")
+
+    result = execute_query("DELETE FROM admin_users WHERE id = %s", (id,), "commit")
+    logging.info(f"[ADMIN] User deleted: id={id}")
+    return {"success": True, "message": "Usuario eliminado"}
+
+
+@router.post("/users/{id}/unlock")
+async def unlock_admin_user(id: int, user: dict = Depends(verify_token)):
+    """Unlock a locked admin user account.
+    Only superadmin can unlock another superadmin."""
+    # Check superadmin protection
+    check_superadmin_protection(id, user.get("sub"))
+
+    result = execute_query(
+        "UPDATE admin_users SET login_attempts = 0, locked_until = NULL WHERE id = %s",
+        (id,), "commit"
+    )
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    logging.info(f"[ADMIN] User unlocked: id={id}")
+    return {"success": True, "message": "Usuario desbloqueado"}
+
+
+@router.post("/users/{id}/reset-password")
+async def reset_admin_password(id: int, user: dict = Depends(verify_token)):
+    """Reset admin user password to default. User must change it on next login.
+    Only superadmin can reset another superadmin's password."""
+    # Check superadmin protection
+    target = check_superadmin_protection(id, user.get("sub"))
+
+    if target["username"] == user.get("sub"):
+        raise HTTPException(status_code=400, detail="No puede resetear su propia contraseña")
+
+    # Use dynamic default password from DB/config
+    default_hash = get_default_password_hash()
+
+    result = execute_query(
+        """UPDATE admin_users SET password_hash = %s, must_change_password = TRUE,
+           login_attempts = 0, locked_until = NULL WHERE id = %s""",
+        (default_hash, id), "commit"
+    )
+    if result["affected_rows"] == 0:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    logging.info(f"[ADMIN] Password reset to default: {target['username']} (id={id})")
+    return {"success": True, "message": f"Contraseña de '{target['username']}' reseteada a valor por defecto"}
+
+
+# === SUPERADMIN SETTINGS ENDPOINTS ===
+
+class DefaultPasswordUpdate(BaseModel):
+    password: str
+
+
+def require_superadmin(user: dict = Depends(verify_token)):
+    """Check that current user is superadmin. Raises 403 if not."""
+    username = user.get("sub")
+    role = get_current_user_role(username)
+    if role != "superadmin":
+        raise HTTPException(status_code=403, detail="Solo superadmin puede acceder a esta configuración")
+    return user
+
+
+@router.get("/settings/default-password")
+async def get_default_password_setting(user: dict = Depends(require_superadmin)):
+    """Get the current default password for new users (superadmin only).
+    Returns the actual password value, not the hash."""
+    try:
+        conn = db.get_connection()
+        if conn:
+            cursor = conn.cursor(dictionary=True, buffered=True)
+            cursor.execute("SELECT config_value FROM system_config WHERE config_key = 'default_password'")
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            if row and row.get('config_value'):
+                return {"password": row['config_value']}
+    except Exception as e:
+        logging.error(f"[ADMIN] Error reading default password: {e}")
+
+    # Return fallback if not set in DB
+    return {"password": DEFAULT_PASSWORD_FALLBACK}
+
+
+@router.put("/settings/default-password")
+async def set_default_password_setting(pwd: DefaultPasswordUpdate, user: dict = Depends(require_superadmin)):
+    """Set the default password for new users (superadmin only).
+    This password will be used when creating new users or resetting passwords."""
+    if len(pwd.password) < 6:
+        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
+
+    query = """INSERT INTO system_config (config_key, config_value)
+               VALUES ('default_password', %s)
+               ON DUPLICATE KEY UPDATE config_value = %s"""
+    execute_query(query, (pwd.password, pwd.password), "commit")
+    logging.info(f"[ADMIN] Default password updated by {user.get('sub')}")
+    return {"success": True, "message": "Contraseña por defecto actualizada"}
+
+
+@router.get("/settings/user-info")
+async def get_current_user_info(user: dict = Depends(verify_token)):
+    """Get current logged-in user's info including role and company_id."""
+    username = user.get("sub")
+    query = """SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.company_id, c.name as company_name
+               FROM admin_users u
+               LEFT JOIN company c ON u.company_id = c.id
+               WHERE u.username = %s"""
+    row = execute_query(query, (username,), "one")
+    if not row:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return row
+
+# === PDF GENERATION ===
+from fastapi.responses import Response
+from src.invoice_pdf import generate_invoice_pdf, get_invoice_filename
+from src.receipt_pdf import generate_receipt_pdf, get_receipt_filename
+
+@router.get("/billing/invoices/{invoice_id}/pdf")
+async def download_invoice_pdf(invoice_id: int, token: str = None):
+    """Download invoice as PDF"""
+    # Verify token from query parameter
+    verify_token_from_query(token)
+    # Get invoice data
+    invoice = execute_query(
+        "SELECT * FROM invoices WHERE id = %s", (invoice_id,), "one"
+    )
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+    
+    # Get invoice items
+    items = execute_query(
+        """SELECT ii.*, p.code, p.name as product_name 
+           FROM invoice_items ii 
+           LEFT JOIN products p ON ii.product_id = p.id 
+           WHERE ii.invoice_id = %s""", 
+        (invoice_id,), "all"
+    ) or []
+    
+    # Get client/company data
+    company = execute_query(
+        "SELECT * FROM company WHERE id = %s", (invoice['company_id'],), "one"
+    ) or {}
+    
+    # Prepare data
+    invoice_data = dict(invoice)
+    items_data = [dict(i) for i in items]
+    client_data = {
+        'cuit': company.get('cuit', ''),
+        'name': company.get('name', ''),
+        'address': company.get('address', ''),
+        'iva_condition': company.get('iva_condition', 'Consumidor Final'),
+    }
+    
+    # Generate PDF
+    pdf_bytes = generate_invoice_pdf(invoice_data, items_data, client_data)
+    filename = get_invoice_filename(invoice_data)
+    
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+@router.get("/billing/account-movements/{movement_id}/pdf")
+async def download_receipt_pdf(movement_id: int, token: str = None):
+    """Download receipt (Recibo X) as PDF for a credit movement"""
+    # Verify token from query parameter
+    verify_token_from_query(token)
+    # Get movement data
+    movement = execute_query(
+        "SELECT * FROM account_movements WHERE id = %s", (movement_id,), "one"
+    )
+    if not movement:
+        raise HTTPException(status_code=404, detail="Movimiento no encontrado")
+
+    if movement['movement_type'] != 'credit':
+        raise HTTPException(status_code=400, detail="Solo se pueden generar recibos para movimientos de tipo crédito (pagos)")
+
+    # Get company data
+    company = execute_query(
+        "SELECT * FROM company WHERE id = %s", (movement['company_id'],), "one"
+    ) or {}
+
+    # Extract receipt number from reference_number or concept
+    receipt_number = 1
+    point_of_sale = 2
+    if movement.get('reference_number'):
+        # Format: 00002-00000001
+        parts = movement['reference_number'].split('-')
+        if len(parts) == 2:
+            point_of_sale = int(parts[0])
+            receipt_number = int(parts[1])
+    else:
+        # Try to extract from concept "Recibo X 00002-00000001 - ..."
+        import re
+        match = re.search(r'Recibo X (\d{5})-(\d{8})', movement.get('concept', ''))
+        if match:
+            point_of_sale = int(match.group(1))
+            receipt_number = int(match.group(2))
+
+    # Prepare receipt data
+    receipt_data = {
+        'point_of_sale': point_of_sale,
+        'receipt_number': receipt_number,
+        'receipt_date': movement.get('movement_date'),
+        'amount': movement.get('credit_amount', 0),
+        'concept': movement.get('concept', 'Pago'),
+        'payment_method': movement.get('payment_method', ''),
+        'reference': movement.get('reference_number', ''),
+        'notes': movement.get('notes', ''),
+    }
+
+    # Check if this is a payment linked to an invoice
+    if movement.get('reference_type') == 'payment' and movement.get('reference_id'):
+        payment = execute_query(
+            """SELECT p.*, i.invoice_type, i.point_of_sale as inv_pos, i.invoice_number
+               FROM payments p
+               LEFT JOIN invoices i ON p.invoice_id = i.id
+               WHERE p.id = %s""",
+            (movement['reference_id'],), "one"
+        )
+        if payment and payment.get('invoice_number'):
+            inv_formatted = f"{payment['inv_pos']:05d}-{payment['invoice_number']:08d}"
+            receipt_data['invoice_info'] = f"Factura {payment['invoice_type']} {inv_formatted}"
+
+    # Prepare client data
+    client_data = {
+        'cuit': company.get('cuit', ''),
+        'name': company.get('name', ''),
+        'address': company.get('address', ''),
+        'iva_condition': company.get('iva_condition', 'Consumidor Final'),
+    }
+
+    # Generate PDF
+    pdf_bytes = generate_receipt_pdf(receipt_data, client_data)
+    filename = get_receipt_filename(receipt_data)
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+# =============================================================================
+# SENSOR HISTORY ENDPOINTS
+# =============================================================================
+
+@router.get("/sensor-history/{device_id}")
+async def get_sensor_history(
+    device_id: str,
+    hours: int = 24,
+    limit: int = 500,
+    date_from: str = None,
+    date_to: str = None,
+    user: dict = Depends(verify_token)
+):
+    """
+    Get historical sensor data for a device.
+
+    Args:
+        device_id: Client ID (e.g., SMART-xxx-xxx)
+        hours: Hours of history to retrieve (default 24, max 720/30 days)
+        limit: Max records to return (default 500, max 5000)
+        date_from: Optional start datetime (ISO format)
+        date_to: Optional end datetime (ISO format)
+
+    Returns:
+        List of sensor data records with timestamps
+    """
+    # Validate parameters
+    hours = min(max(hours, 1), 720)  # 1 hour to 30 days
+    limit = min(max(limit, 10), 5000)
+
+    # Import db module
+    from . import db
+
+    # If custom date range provided, use that instead of hours
+    if date_from and date_to:
+        history = db.get_sensor_history_by_date(device_id, date_from, date_to, limit)
+        return {
+            "device_id": device_id,
+            "date_from": date_from,
+            "date_to": date_to,
+            "count": len(history),
+            "data": history
+        }
+
+    # Get history from database using hours
+    history = db.get_sensor_history(device_id, hours, limit)
+
+    return {
+        "device_id": device_id,
+        "hours": hours,
+        "count": len(history),
+        "data": history
+    }
+
+
+# =============================================================================
+# COMPANY LOGS ENDPOINTS
+# =============================================================================
+
+@router.get("/company-logs/{company_id}")
+async def get_company_logs(
+    company_id: int,
+    date_from: str = None,
+    date_to: str = None,
+    device_id: str = None,
+    log_type: str = None,
+    limit: int = 200,
+    user: dict = Depends(verify_token)
+):
+    """
+    Get logs for a company (alerts, commands, system events).
+
+    Args:
+        company_id: Company ID
+        date_from: Start date (YYYY-MM-DD), defaults to 7 days ago
+        date_to: End date (YYYY-MM-DD), defaults to today
+        device_id: Optional filter by device client_id
+        log_type: Optional filter: 'alerts', 'commands', 'all' (default: all)
+        limit: Max records per category (default 200, max 500)
+
+    Returns:
+        Dict with alerts, commands arrays and summary counts
+    """
+    from datetime import datetime, timedelta
+    from . import db as db_module
+
+    # Validate and parse dates
+    limit = min(max(limit, 10), 500)
+
+    if not date_from:
+        date_from = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+    if not date_to:
+        date_to = datetime.now().strftime('%Y-%m-%d')
+
+    # Add time to dates for proper range
+    date_from_dt = f"{date_from} 00:00:00"
+    date_to_dt = f"{date_to} 23:59:59"
+
+    conn = None
+    cursor = None
+    try:
+        conn = db_module.get_connection()
+        if conn is None:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+
+        cursor = conn.cursor(dictionary=True, buffered=True)
+
+        # Get device IDs and labels for this company
+        cursor.execute(
+            """SELECT client_id, name, alias, relay_labels, input_labels
+               FROM hardware WHERE company_id = %s AND is_active = 1""",
+            (company_id,)
+        )
+        device_rows = cursor.fetchall()
+        company_devices = [row['client_id'] for row in device_rows]
+
+        # Build device labels dictionary for frontend
+        devices_info = {}
+        for row in device_rows:
+            relay_labels = []
+            input_labels = []
+            # Parse JSON labels
+            if row.get('relay_labels'):
+                try:
+                    relay_labels = json.loads(row['relay_labels']) if isinstance(row['relay_labels'], str) else row['relay_labels']
+                except:
+                    relay_labels = []
+            if row.get('input_labels'):
+                try:
+                    input_labels = json.loads(row['input_labels']) if isinstance(row['input_labels'], str) else row['input_labels']
+                except:
+                    input_labels = []
+
+            devices_info[row['client_id']] = {
+                "name": row.get('name') or row.get('alias') or row['client_id'],
+                "relay_labels": relay_labels or ["Relé 1", "Relé 2", "Relé 3", "Relé 4"],
+                "input_labels": input_labels or ["DI0", "DI1", "DI2", "DI3", "DI4", "DI5", "DI6"]
+            }
+
+        if not company_devices:
+            return {
+                "company_id": company_id,
+                "date_from": date_from,
+                "date_to": date_to,
+                "alerts": [],
+                "commands": [],
+                "summary": {"alerts": 0, "commands": 0, "alerts_silenced": 0, "alerts_notified": 0}
+            }
+
+        # Filter by specific device if provided
+        if device_id and device_id in company_devices:
+            device_filter = [device_id]
+        else:
+            device_filter = company_devices
+
+        placeholders = ','.join(['%s'] * len(device_filter))
+
+        alerts = []
+        commands = []
+
+        # Get alerts
+        if log_type in (None, 'all', 'alerts'):
+            query = f"""
+                SELECT
+                    a.id,
+                    a.device_client_id,
+                    h.name as device_name,
+                    a.alert_type,
+                    a.alert_message,
+                    a.alert_value,
+                    a.was_silenced,
+                    a.was_notified,
+                    a.created_at
+                FROM alert_event_log a
+                LEFT JOIN hardware h ON a.device_client_id = h.client_id
+                WHERE a.device_client_id IN ({placeholders})
+                  AND a.created_at BETWEEN %s AND %s
+                ORDER BY a.created_at DESC
+                LIMIT %s
+            """
+            cursor.execute(query, (*device_filter, date_from_dt, date_to_dt, limit))
+            alerts = cursor.fetchall()
+            # Convert datetime to string for JSON
+            for a in alerts:
+                if a['created_at']:
+                    a['created_at'] = a['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+
+        # Get commands
+        if log_type in (None, 'all', 'commands'):
+            query = f"""
+                SELECT
+                    c.id,
+                    c.client_id as device_client_id,
+                    h.name as device_name,
+                    c.source,
+                    c.source_id,
+                    c.command_text,
+                    c.relay_mask,
+                    c.status,
+                    c.created_at,
+                    c.confirmed_at
+                FROM do_commands_raw c
+                LEFT JOIN hardware h ON c.client_id = h.client_id
+                WHERE c.client_id IN ({placeholders})
+                  AND c.created_at BETWEEN %s AND %s
+                ORDER BY c.created_at DESC
+                LIMIT %s
+            """
+            cursor.execute(query, (*device_filter, date_from_dt, date_to_dt, limit))
+            commands = cursor.fetchall()
+            # Convert datetime to string for JSON
+            for c in commands:
+                if c['created_at']:
+                    c['created_at'] = c['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+                if c['confirmed_at']:
+                    c['confirmed_at'] = c['confirmed_at'].strftime('%Y-%m-%d %H:%M:%S')
+
+        # Calculate summary
+        summary = {
+            "alerts": len(alerts),
+            "commands": len(commands),
+            "alerts_silenced": sum(1 for a in alerts if a.get('was_silenced')),
+            "alerts_notified": sum(1 for a in alerts if a.get('was_notified')),
+            "commands_whatsapp": sum(1 for c in commands if c.get('source') == 'whatsapp'),
+            "commands_admin": sum(1 for c in commands if c.get('source') == 'admin'),
+            "commands_device": sum(1 for c in commands if c.get('source') == 'device')
+        }
+
+        return {
+            "company_id": company_id,
+            "date_from": date_from,
+            "date_to": date_to,
+            "device_filter": device_id,
+            "alerts": alerts,
+            "commands": commands,
+            "summary": summary,
+            "devices": devices_info
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[LOGS] Error getting company logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+# =============================================================================
+# I/O STATE CHANGES HISTORY (for Dashboard charts)
+# =============================================================================
+
+@router.get("/io-history/{device_id}")
+async def get_io_history(
+    device_id: str,
+    hours: int = 24,
+    io_type: str = None,
+    limit: int = 500,
+    user: dict = Depends(verify_token)
+):
+    """
+    Get I/O state change history for a device.
+
+    Args:
+        device_id: Client ID (e.g., SMART-xxx-xxx)
+        hours: Hours of history to retrieve (default 24, max 720)
+        io_type: Filter by type: 'DO' (relays), 'DI' (inputs), or None (all)
+        limit: Max records to return (default 500, max 2000)
+
+    Returns:
+        List of state changes with io_type, io_index, old_value, new_value, timestamp
+    """
+    from . import db as db_module
+    from datetime import datetime, timedelta
+
+    hours = min(max(hours, 1), 720)
+    limit = min(max(limit, 10), 2000)
+
+    conn = None
+    cursor = None
+    try:
+        conn = db_module.get_connection()
+        if conn is None:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+
+        cursor = conn.cursor(dictionary=True, buffered=True)
+
+        # Get hardware_id
+        cursor.execute("SELECT id FROM hardware WHERE client_id = %s", (device_id,))
+        hw = cursor.fetchone()
+        if not hw:
+            raise HTTPException(status_code=404, detail="Device not found")
+
+        hardware_id = hw['id']
+        since = datetime.now() - timedelta(hours=hours)
+
+        # Build query
+        if io_type and io_type.upper() in ('DO', 'DI'):
+            cursor.execute("""
+                SELECT sc.io_type, sc.io_index, sc.old_value, sc.new_value,
+                       sc.change_source, sc.detected_at,
+                       COALESCE(io.label, CONCAT(sc.io_type, sc.io_index)) as label
+                FROM state_changes sc
+                LEFT JOIN io_config io ON sc.hardware_id = io.hardware_id
+                    AND sc.io_type = io.io_type AND sc.io_index = io.io_index
+                WHERE sc.hardware_id = %s
+                  AND sc.io_type = %s
+                  AND sc.detected_at >= %s
+                ORDER BY sc.detected_at ASC
+                LIMIT %s
+            """, (hardware_id, io_type.upper(), since, limit))
+        else:
+            cursor.execute("""
+                SELECT sc.io_type, sc.io_index, sc.old_value, sc.new_value,
+                       sc.change_source, sc.detected_at,
+                       COALESCE(io.label, CONCAT(sc.io_type, sc.io_index)) as label
+                FROM state_changes sc
+                LEFT JOIN io_config io ON sc.hardware_id = io.hardware_id
+                    AND sc.io_type = io.io_type AND sc.io_index = io.io_index
+                WHERE sc.hardware_id = %s
+                  AND sc.detected_at >= %s
+                ORDER BY sc.detected_at ASC
+                LIMIT %s
+            """, (hardware_id, since, limit))
+
+        changes = cursor.fetchall()
+
+        # Convert datetime to ISO string
+        for c in changes:
+            if c.get('detected_at'):
+                c['detected_at'] = c['detected_at'].isoformat()
+
+        return {
+            "device_id": device_id,
+            "hours": hours,
+            "io_type_filter": io_type,
+            "count": len(changes),
+            "data": changes
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[IO-HISTORY] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+@router.get("/alerts-history/{device_id}")
+async def get_alerts_history(
+    device_id: str,
+    hours: int = 24,
+    limit: int = 200,
+    user: dict = Depends(verify_token)
+):
+    """
+    Get alert history for a device (for marking on sensor charts).
+
+    Args:
+        device_id: Client ID (e.g., SMART-xxx-xxx)
+        hours: Hours of history to retrieve (default 24, max 720)
+        limit: Max records to return (default 200, max 1000)
+
+    Returns:
+        List of alerts with type, source, message, priority, timestamp
+    """
+    from . import db as db_module
+    from datetime import datetime, timedelta
+
+    hours = min(max(hours, 1), 720)
+    limit = min(max(limit, 10), 1000)
+
+    conn = None
+    cursor = None
+    try:
+        conn = db_module.get_connection()
+        if conn is None:
+            raise HTTPException(status_code=500, detail="Database connection failed")
+
+        cursor = conn.cursor(dictionary=True, buffered=True)
+
+        # Get hardware_id
+        cursor.execute("SELECT id FROM hardware WHERE client_id = %s", (device_id,))
+        hw = cursor.fetchone()
+        if not hw:
+            raise HTTPException(status_code=404, detail="Device not found")
+
+        hardware_id = hw['id']
+        since = datetime.now() - timedelta(hours=hours)
+
+        # Get alerts from alarms table
+        cursor.execute("""
+            SELECT a.alarm_type, a.source_type, a.source_index,
+                   a.trigger_value, a.threshold_value, a.message,
+                   a.priority, a.status, a.triggered_at,
+                   a.acknowledged_at, a.resolved_at,
+                   COALESCE(io.label, CONCAT(a.source_type, COALESCE(a.source_index, ''))) as source_label
+            FROM alarms a
+            LEFT JOIN io_config io ON a.hardware_id = io.hardware_id
+                AND a.source_type = io.io_type AND a.source_index = io.io_index
+            WHERE a.hardware_id = %s
+              AND a.triggered_at >= %s
+            ORDER BY a.triggered_at ASC
+            LIMIT %s
+        """, (hardware_id, since, limit))
+
+        alerts = cursor.fetchall()
+
+        # Convert datetimes to ISO strings
+        for a in alerts:
+            for field in ['triggered_at', 'acknowledged_at', 'resolved_at']:
+                if a.get(field):
+                    a[field] = a[field].isoformat()
+
+        return {
+            "device_id": device_id,
+            "hours": hours,
+            "count": len(alerts),
+            "data": alerts
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[ALERTS-HISTORY] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
