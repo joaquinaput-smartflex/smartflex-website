@@ -1,0 +1,330 @@
+<!-- ============================================
+     PROYECTOS WEB - Sidebar Section
+     Insert after sidebarConfig section
+     ============================================ -->
+                    <div class="sidebar-section" id="sidebarWebProjects">
+                        <button class="sidebar-toggle" onclick="toggleSubmenu(this)">
+                            Sitio Web <span class="arrow">&#9660;</span>
+                        </button>
+                        <div class="sidebar-submenu">
+                            <button class="btn btn-info btn-sm" onclick="showWebProjects()">Proyectos</button>
+                            <button class="btn btn-success btn-sm" onclick="openWebProjectModal()">+ Nuevo Proyecto</button>
+                        </div>
+                    </div>
+
+
+<!-- ============================================
+     PROYECTOS WEB - Content Section
+     Add to main content area
+     ============================================ -->
+
+<!-- Web Projects Section -->
+<div id="webProjectsSection" style="display:none;">
+    <div class="section-header">
+        <h2>Proyectos del Sitio Web</h2>
+        <p>Gestiona los proyectos que se muestran en smartflex.com.ar</p>
+    </div>
+
+    <div style="margin-bottom: 20px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+        <button class="btn btn-success" onclick="openWebProjectModal()">+ Nuevo Proyecto</button>
+        <select id="filterProjectCategory" onchange="loadWebProjects()" style="padding: 8px; border-radius: 6px; border: 1px solid #ddd;">
+            <option value="">Todas las categorias</option>
+            <option value="construccion">Construccion</option>
+            <option value="vivienda">Vivienda</option>
+            <option value="reforma">Reforma</option>
+            <option value="iot">IoT</option>
+            <option value="industrial">Industrial</option>
+        </select>
+        <label style="display: flex; align-items: center; gap: 5px;">
+            <input type="checkbox" id="filterFeaturedOnly" onchange="loadWebProjects()">
+            Solo destacados
+        </label>
+    </div>
+
+    <div id="webProjectsGrid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px;">
+        <!-- Projects loaded here -->
+    </div>
+</div>
+
+<!-- Web Project Modal -->
+<div id="webProjectModal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width: 700px;">
+        <span class="close" onclick="closeWebProjectModal()">&times;</span>
+        <h2 id="webProjectModalTitle">Nuevo Proyecto</h2>
+
+        <form id="webProjectForm" onsubmit="saveWebProject(event)">
+            <input type="hidden" id="webProjectId">
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                <div class="form-group" style="grid-column: 1 / -1;">
+                    <label>Titulo *</label>
+                    <input type="text" id="webProjectTitle" required class="form-control">
+                </div>
+
+                <div class="form-group">
+                    <label>Categoria *</label>
+                    <select id="webProjectCategory" required class="form-control">
+                        <option value="construccion">Construccion</option>
+                        <option value="vivienda">Vivienda</option>
+                        <option value="reforma">Reforma</option>
+                        <option value="iot">IoT</option>
+                        <option value="industrial">Industrial</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Orden de visualizacion</label>
+                    <input type="number" id="webProjectOrder" value="0" min="0" class="form-control">
+                </div>
+
+                <div class="form-group" style="grid-column: 1 / -1;">
+                    <label>Descripcion corta (se muestra en tarjeta)</label>
+                    <textarea id="webProjectShortDesc" rows="2" class="form-control" maxlength="500"></textarea>
+                </div>
+
+                <div class="form-group" style="grid-column: 1 / -1;">
+                    <label>Descripcion completa</label>
+                    <textarea id="webProjectDesc" rows="4" class="form-control"></textarea>
+                </div>
+
+                <div class="form-group">
+                    <label>Nombre de imagen</label>
+                    <input type="text" id="webProjectImage" class="form-control" placeholder="nombre-imagen.jpg">
+                    <small style="color: #666;">Archivo en /assets/images/projects/</small>
+                </div>
+
+                <div class="form-group">
+                    <label>Texto alternativo imagen</label>
+                    <input type="text" id="webProjectImageAlt" class="form-control" placeholder="Descripcion de la imagen">
+                </div>
+
+                <div class="form-group">
+                    <label>Ubicacion</label>
+                    <input type="text" id="webProjectLocation" class="form-control" placeholder="Buenos Aires, Argentina">
+                </div>
+
+                <div class="form-group">
+                    <label>Ano completado</label>
+                    <input type="number" id="webProjectYear" class="form-control" min="2000" max="2030">
+                </div>
+
+                <div class="form-group">
+                    <label>Cliente</label>
+                    <input type="text" id="webProjectClient" class="form-control">
+                </div>
+
+                <div class="form-group">
+                    <label>Metros cuadrados</label>
+                    <input type="number" id="webProjectSqm" class="form-control" min="0">
+                </div>
+
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 10px;">
+                        <input type="checkbox" id="webProjectFeatured">
+                        Proyecto destacado (mostrar en home)
+                    </label>
+                </div>
+
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 10px;">
+                        <input type="checkbox" id="webProjectActive" checked>
+                        Activo
+                    </label>
+                </div>
+            </div>
+
+            <div style="margin-top: 20px; display: flex; gap: 10px; justify-content: flex-end;">
+                <button type="button" class="btn btn-secondary" onclick="closeWebProjectModal()">Cancelar</button>
+                <button type="submit" class="btn btn-primary">Guardar</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+
+<!-- ============================================
+     PROYECTOS WEB - JavaScript Functions
+     Add to script section
+     ============================================ -->
+<script>
+// =====================
+// WEB PROJECTS MANAGEMENT
+// =====================
+
+async function showWebProjects() {
+    hideAllSections();
+    document.getElementById('webProjectsSection').style.display = 'block';
+    await loadWebProjects();
+}
+
+async function loadWebProjects() {
+    const grid = document.getElementById('webProjectsGrid');
+    grid.innerHTML = '<p style="text-align:center; padding: 40px;">Cargando proyectos...</p>';
+
+    try {
+        const category = document.getElementById('filterProjectCategory')?.value || '';
+        const featuredOnly = document.getElementById('filterFeaturedOnly')?.checked || false;
+
+        let url = '/admin/api/web-projects?';
+        if (category) url += `category=${category}&`;
+        if (featuredOnly) url += 'featured_only=true&';
+
+        const response = await api(url);
+        const projects = response.projects || [];
+
+        if (projects.length === 0) {
+            grid.innerHTML = '<p style="text-align:center; padding: 40px; color: #666;">No hay proyectos. Crea el primero!</p>';
+            return;
+        }
+
+        grid.innerHTML = projects.map(p => `
+            <div class="project-card-admin" style="background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+                <div style="height: 180px; background: #f0f0f0; display: flex; align-items: center; justify-content: center; overflow: hidden;">
+                    ${p.image_filename
+                        ? `<img src="https://smartflex.com.ar/assets/images/projects/${p.image_filename}" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.parentElement.innerHTML='<span style=color:#999>Sin imagen</span>'">`
+                        : '<span style="color: #999;">Sin imagen</span>'
+                    }
+                </div>
+                <div style="padding: 15px;">
+                    <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 8px;">
+                        <span style="background: ${getCategoryColor(p.category)}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">
+                            ${formatProjectCategory(p.category)}
+                        </span>
+                        <div style="display: flex; gap: 5px;">
+                            ${p.is_featured ? '<span style="background: #ffd700; padding: 2px 6px; border-radius: 4px; font-size: 11px;">★</span>' : ''}
+                            ${!p.is_active ? '<span style="background: #dc3545; color: white; padding: 2px 6px; border-radius: 4px; font-size: 11px;">Inactivo</span>' : ''}
+                        </div>
+                    </div>
+                    <h3 style="margin: 0 0 8px 0; font-size: 16px;">${p.title}</h3>
+                    <p style="margin: 0 0 12px 0; font-size: 13px; color: #666; line-height: 1.4;">${p.short_description || '<em>Sin descripcion</em>'}</p>
+                    <div style="display: flex; gap: 8px;">
+                        <button class="btn btn-sm btn-primary" onclick="editWebProject(${p.id})">Editar</button>
+                        <button class="btn btn-sm btn-danger" onclick="deleteWebProject(${p.id}, '${p.title.replace(/'/g, "\\'")}')">Eliminar</button>
+                    </div>
+                </div>
+            </div>
+        `).join('');
+
+    } catch (error) {
+        console.error('Error loading projects:', error);
+        grid.innerHTML = '<p style="text-align:center; padding: 40px; color: #dc3545;">Error al cargar proyectos</p>';
+    }
+}
+
+function getCategoryColor(category) {
+    const colors = {
+        'construccion': '#1a73e8',
+        'vivienda': '#34a853',
+        'reforma': '#ea4335',
+        'iot': '#9c27b0',
+        'industrial': '#ff9800'
+    };
+    return colors[category] || '#666';
+}
+
+function formatProjectCategory(category) {
+    const names = {
+        'construccion': 'Construccion',
+        'vivienda': 'Vivienda',
+        'reforma': 'Reforma',
+        'iot': 'IoT',
+        'industrial': 'Industrial'
+    };
+    return names[category] || category;
+}
+
+function openWebProjectModal(project = null) {
+    const modal = document.getElementById('webProjectModal');
+    const title = document.getElementById('webProjectModalTitle');
+    const form = document.getElementById('webProjectForm');
+
+    form.reset();
+    document.getElementById('webProjectId').value = '';
+    document.getElementById('webProjectActive').checked = true;
+
+    if (project) {
+        title.textContent = 'Editar Proyecto';
+        document.getElementById('webProjectId').value = project.id;
+        document.getElementById('webProjectTitle').value = project.title || '';
+        document.getElementById('webProjectCategory').value = project.category || 'construccion';
+        document.getElementById('webProjectOrder').value = project.display_order || 0;
+        document.getElementById('webProjectShortDesc').value = project.short_description || '';
+        document.getElementById('webProjectDesc').value = project.description || '';
+        document.getElementById('webProjectImage').value = project.image_filename || '';
+        document.getElementById('webProjectImageAlt').value = project.image_alt || '';
+        document.getElementById('webProjectLocation').value = project.location || '';
+        document.getElementById('webProjectYear').value = project.year_completed || '';
+        document.getElementById('webProjectClient').value = project.client_name || '';
+        document.getElementById('webProjectSqm').value = project.square_meters || '';
+        document.getElementById('webProjectFeatured').checked = project.is_featured || false;
+        document.getElementById('webProjectActive').checked = project.is_active !== false;
+    } else {
+        title.textContent = 'Nuevo Proyecto';
+    }
+
+    modal.style.display = 'flex';
+}
+
+function closeWebProjectModal() {
+    document.getElementById('webProjectModal').style.display = 'none';
+}
+
+async function editWebProject(id) {
+    try {
+        const project = await api(`/admin/api/web-projects/${id}`);
+        openWebProjectModal(project);
+    } catch (error) {
+        console.error('Error loading project:', error);
+        alert('Error al cargar el proyecto');
+    }
+}
+
+async function saveWebProject(event) {
+    event.preventDefault();
+
+    const id = document.getElementById('webProjectId').value;
+    const data = {
+        title: document.getElementById('webProjectTitle').value,
+        category: document.getElementById('webProjectCategory').value,
+        display_order: parseInt(document.getElementById('webProjectOrder').value) || 0,
+        short_description: document.getElementById('webProjectShortDesc').value || null,
+        description: document.getElementById('webProjectDesc').value || null,
+        image_filename: document.getElementById('webProjectImage').value || null,
+        image_alt: document.getElementById('webProjectImageAlt').value || null,
+        location: document.getElementById('webProjectLocation').value || null,
+        year_completed: parseInt(document.getElementById('webProjectYear').value) || null,
+        client_name: document.getElementById('webProjectClient').value || null,
+        square_meters: parseInt(document.getElementById('webProjectSqm').value) || null,
+        is_featured: document.getElementById('webProjectFeatured').checked,
+        is_active: document.getElementById('webProjectActive').checked
+    };
+
+    try {
+        if (id) {
+            await api(`/admin/api/web-projects/${id}`, 'PUT', data);
+            alert('Proyecto actualizado');
+        } else {
+            await api('/admin/api/web-projects', 'POST', data);
+            alert('Proyecto creado');
+        }
+        closeWebProjectModal();
+        loadWebProjects();
+    } catch (error) {
+        console.error('Error saving project:', error);
+        alert('Error al guardar: ' + (error.message || 'Error desconocido'));
+    }
+}
+
+async function deleteWebProject(id, title) {
+    if (!confirm(`¿Eliminar el proyecto "${title}"?`)) return;
+
+    try {
+        await api(`/admin/api/web-projects/${id}`, 'DELETE');
+        alert('Proyecto eliminado');
+        loadWebProjects();
+    } catch (error) {
+        console.error('Error deleting project:', error);
+        alert('Error al eliminar: ' + (error.message || 'Error desconocido'));
+    }
+}
+</script>
